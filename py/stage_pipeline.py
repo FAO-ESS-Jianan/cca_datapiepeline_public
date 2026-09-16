@@ -50,7 +50,6 @@ DataFrame of what *would* run, for review before committing.
 
 from __future__ import annotations
 
-import ast
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
@@ -211,7 +210,9 @@ class StagePipeline:
         stg_view: Optional[str] = None,
     ) -> pd.DataFrame:
         """Read cfg_indicator_tbl filtered by status (and optionally a
-        single stg_view), parsing filter_value into native Python lists.
+        single stg_view). filter_value is expected to already be a valid
+        SQL fragment (e.g. "('a', 'b')" or "5"), so it's used as-is when
+        building the WHERE clause — no parsing here.
         """
         query = f"""
         SELECT *
@@ -233,7 +234,6 @@ class StagePipeline:
         if missing:
             raise ValueError(f"cfg_indicator_tbl is missing required columns: {missing}")
 
-        df_cfg["filter_lst"] = df_cfg["filter_value"].apply(ast.literal_eval)
         return df_cfg
 
     # ------------------------------------------------------------------
@@ -243,9 +243,9 @@ class StagePipeline:
     @staticmethod
     def _format_value(val: Any) -> str:
         """Formats a scalar Python value into a valid SQL string literal
-        or primitive. Only ever called with scalars — list-valued
-        filters are expanded into their elements by _build_condition
-        before this is called."""
+        or primitive. Used for values this class constructs itself (e.g.
+        afs_uid), not for filter_value, which is already a ready-to-use
+        SQL fragment supplied by the config."""
         if val is None or pd.isna(val):
             return "NULL"
         if isinstance(val, str):
@@ -253,13 +253,12 @@ class StagePipeline:
             return f"'{escaped}'"
         return str(val)
 
-    @classmethod
-    def _build_condition(cls, key: str, opt: str, val_list: Any) -> str:
-        """Constructs a single SQL WHERE clause condition."""
-        if isinstance(val_list, (list, set, tuple)):
-            formatted_vals = ", ".join(cls._format_value(v) for v in val_list)
-            return f"{key} {opt} ({formatted_vals})"
-        return f"{key} {opt} {cls._format_value(val_list)}"
+    @staticmethod
+    def _build_condition(key: str, opt: str, val: Any) -> str:
+        """Constructs a single SQL WHERE clause condition. val is taken
+        as-is: filter_value is expected to already be a valid SQL
+        fragment (e.g. "('a', 'b')" for an IN clause, or "5")."""
+        return f"{key} {opt} {val}"
 
     def _build_indicator_queries(self, df_cfg: pd.DataFrame) -> pd.DataFrame:
         """One row per (afs_uid, src_idx, stg_view, stg_tbl) group: the
@@ -272,7 +271,7 @@ class StagePipeline:
 
         df = df_cfg.copy()
         df["single_condition"] = df.apply(
-            lambda row: self._build_condition(row["filter_key"], row["filter_opt"], row["filter_lst"]),
+            lambda row: self._build_condition(row["filter_key"], row["filter_opt"], row["filter_value"]),
             axis=1,
         )
 
