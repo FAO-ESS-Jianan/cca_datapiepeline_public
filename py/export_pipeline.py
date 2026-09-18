@@ -18,8 +18,13 @@ tight schedule):
 
 1. `build_long_view()`  — CREATE OR REPLACE VIEW `exp_stg_all_long_vw`
                            as the UNION ALL of every `stg_*_tbl` whose
-                           `afs_source_code` is ACTIVE/REVIEW in
-                           `cfg_stage_tbl`.
+                           `afs_source_code` appears (non-null, any
+                           status) in `cfg_stage_tbl`. Before unioning,
+                           every discovered `stg_*_tbl`'s column names
+                           are compared against each other; a mismatch
+                           raises with a per-table diff so a schema
+                           drift on one source is easy to trace back to
+                           that specific table.
 
 2. `build_final_table()` — CREATE OR REPLACE TABLE `exp_stg_all_long_tbl`,
                            clustered by (afs_m49_code, afs_indicator_uid).
@@ -62,6 +67,7 @@ committing.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -80,8 +86,13 @@ REQUIRED_CFG_STAGE_COLUMNS = {
 
 REQUIRED_SCOPE_COLUMNS = {"m49_code", "area_name"}
 
-# Which cfg_stage_tbl statuses count as "currently live" for both the
-# stg_tbl discovery (step 1) and the indicator scaffold (step 2).
+# Which cfg_stage_tbl statuses count as "currently live" for the
+# indicator scaffold (step 2) and the taxonomy-consistency check.
+# NOT used for stg_tbl discovery (step 1) — that step takes every
+# non-null afs_source_code regardless of status, since a stg_tbl can
+# hold real data even for an indicator that isn't ACTIVE/REVIEW right
+# now, and the long view is meant to reflect everything physically
+# present, not just what's currently reviewed.
 ACTIVE_STATUSES = ["ACTIVE", "REVIEW"]
 
 # Same cap as StagePipeline — keeps one long BQ error message from
@@ -235,12 +246,14 @@ class ExportPipeline:
         """Confirms cfg_stage_tbl and the scope table exist (this class
         never creates either). Ensures the log table exists, creating
         it if not. Confirms gcs_uri has no wildcard (single-file export
-        only). Warns (does not raise) if any afs_uid has inconsistent
-        taxonomy fields across cfg rows, since that would inflate the
-        scaffold. Safe to call repeatedly; build_long_view(),
-        build_final_table() and export_to_gcs() don't call this
-        automatically (they're meant to be usable standalone during
-        debugging) — only run_all() calls it first.
+        only). Raises with a per-table diff if the discovered stg_tbl
+        don't all share the same columns (see
+        _check_schema_consistency). Warns (does not raise) if any
+        afs_uid has inconsistent taxonomy fields across cfg rows, since
+        that would inflate the scaffold. Safe to call repeatedly;
+        build_long_view(), build_final_table() and export_to_gcs()
+        don't call this automatically (they're meant to be usable
+        standalone during debugging) — only run_all() calls it first.
         """
         existing = self._existing_tables()
 
@@ -271,6 +284,9 @@ class ExportPipeline:
             )
         print(f"GCS URI '{self.gcs_uri}' has no wildcard — single-file export OK.")
 
+        stg_tables = self._discover_stg_tables()
+        self._check_schema_consistency(stg_tables)
+
         df_dupes = self._check_taxonomy_consistency()
         if not df_dupes.empty:
             print(
@@ -286,22 +302,24 @@ class ExportPipeline:
     # ------------------------------------------------------------------
 
     def _discover_stg_tables(self) -> List[str]:
-        """Distinct afs_source_code from cfg_stage_tbl (status in
-        ACTIVE/REVIEW) -> expected stg_tbl names via the same naming
-        rule StagePipeline uses -> keep only the ones that physically
-        exist. A source configured but not yet built (e.g. still
+        """All non-null, distinct afs_source_code in cfg_stage_tbl —
+        status is deliberately ignored here (unlike the indicator
+        scaffold, which does filter by ACTIVE_STATUSES): this step's
+        job is to find every stg_tbl that physically has data worth
+        including in the long view, regardless of where its indicators
+        currently sit in the review lifecycle. Each afs_source_code is
+        turned into its expected stg_tbl name via the same naming rule
+        StagePipeline uses, then only the ones that physically exist
+        are kept. A source configured but not yet built (e.g. still
         DRAFT-only, never reconstructed) is skipped with a warning
         rather than failing the whole run.
         """
         sql = f"""
         SELECT DISTINCT afs_source_code
         FROM `{self._cfg_stage_table_fqn}`
-        WHERE status IN UNNEST(@statuses)
+        WHERE afs_source_code IS NOT NULL
         """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("statuses", "STRING", ACTIVE_STATUSES)]
-        )
-        df = self.bq_client.query(sql, job_config=job_config).to_dataframe()
+        df = self.bq_client.query(sql).to_dataframe()
 
         expected = {
             self._stg_tbl_name(code) for code in df["afs_source_code"].dropna().unique()
@@ -315,6 +333,58 @@ class ExportPipeline:
                 f"WARNING: {len(missing)} expected stg_tbl not found and will be skipped: {missing}"
             )
         return found
+
+    def _check_schema_consistency(self, stg_tables: List[str]) -> None:
+        """UNION ALL matches columns positionally, so every stg_tbl
+        going into the long view must have the exact same column names
+        in the exact same order — a plain `SELECT *` union will produce
+        silently wrong results (or a cryptic BigQuery error) otherwise.
+
+        Fetches each table's column list (one get_table() call per
+        table — metadata only, no query cost) and compares them all
+        against whichever schema the majority of tables share. Raises
+        with a clear per-table diff naming exactly which table(s) are
+        the odd one(s) out and how (missing columns, extra columns, or
+        same columns in a different order), rather than letting the
+        first confusing BigQuery UNION ALL error be the only clue.
+        Called from both validate() and build_long_view(), so the
+        problem surfaces whichever way the pipeline is run.
+        """
+        if not stg_tables:
+            return
+
+        schemas: Dict[str, tuple] = {
+            t: tuple(f.name for f in self.bq_client.get_table(self._table_fqn(t)).schema)
+            for t in stg_tables
+        }
+
+        counts = Counter(schemas.values())
+        baseline_schema, n_agree = counts.most_common(1)[0]
+        mismatches = {t: cols for t, cols in schemas.items() if cols != baseline_schema}
+        if not mismatches:
+            print(f"Schema check OK: all {len(stg_tables)} stg_tbl share the same {len(baseline_schema)} columns.")
+            return
+
+        baseline_set = set(baseline_schema)
+        lines = [
+            f"Schema mismatch across {len(mismatches)}/{len(stg_tables)} stg_tbl. "
+            f"Majority schema ({len(baseline_schema)} column(s), shared by {n_agree} table(s)): "
+            f"{list(baseline_schema)}"
+        ]
+        for t, cols in sorted(mismatches.items()):
+            col_set = set(cols)
+            missing = [c for c in baseline_schema if c not in col_set]
+            extra = [c for c in cols if c not in baseline_set]
+            detail = f"  - `{t}`: {len(cols)} column(s)"
+            if missing:
+                detail += f", missing {missing}"
+            if extra:
+                detail += f", extra {extra}"
+            if not missing and not extra:
+                detail += f", same columns but different ORDER: {list(cols)}"
+            lines.append(detail)
+
+        raise ValueError("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Step 2 — long view
@@ -332,8 +402,14 @@ class ExportPipeline:
         replace — a view definition, not stored data, so there's no
         incremental mode to speak of. rows_affected is left None here:
         a view holds no data of its own to count.
+
+        Runs _check_schema_consistency() first (even on a dry run —
+        it's metadata-only, no query cost) so a column mismatch across
+        stg_tbl is caught here, with a per-table diff, instead of
+        surfacing later as a confusing UNION ALL error from BigQuery.
         """
         stg_tables = self._discover_stg_tables()
+        self._check_schema_consistency(stg_tables)
         union_query = self._build_long_view_query(stg_tables)
 
         if not confirm_apply:
