@@ -393,7 +393,7 @@ class ExportPipeline:
     def _build_long_view_query(self, stg_tables: List[str]) -> str:
         if not stg_tables:
             raise ValueError("No stg_tbl available to union into the long view.")
-        selects = [f"SELECT * FROM `{self._table_fqn(t)}`" for t in stg_tables]
+        selects = [f"SELECT * FROM `{self._table_fqn(t)}` WHERE afs_year >= {self.start_year}" for t in stg_tables]
         return "\nUNION ALL\n".join(selects)
 
     def build_long_view(self, confirm_apply: bool = False) -> Dict[str, Any]:
@@ -476,9 +476,9 @@ class ExportPipeline:
         scaffold_query = self._build_scaffold_query()
         return f"""
         SELECT
-          COALESCE(scaffold.afs_m49_code, long_vw.afs_m49_code) AS afs_m49_code,
-          COALESCE(scaffold.afs_indicator_uid, long_vw.afs_indicator_uid) AS afs_indicator_uid,
-          COALESCE(scaffold.afs_year, long_vw.afs_year) AS afs_year,
+          scaffold.afs_m49_code AS afs_m49_code,
+          scaffold.afs_indicator_uid AS afs_indicator_uid,
+          scaffold.afs_year AS afs_year,
           scaffold.* EXCEPT (afs_m49_code, afs_indicator_uid, afs_year),
           long_vw.* EXCEPT (afs_m49_code, afs_indicator_uid, afs_year)
         FROM ({scaffold_query}) AS scaffold
@@ -486,7 +486,6 @@ class ExportPipeline:
           ON scaffold.afs_m49_code = long_vw.afs_m49_code
           AND scaffold.afs_indicator_uid = long_vw.afs_indicator_uid
           AND scaffold.afs_year = long_vw.afs_year
-        ORDER BY afs_m49_code, afs_indicator_uid, afs_year
         """
 
     def build_final_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
