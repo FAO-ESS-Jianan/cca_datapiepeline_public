@@ -456,7 +456,7 @@ class ExportPipeline:
         )
         SELECT
           scope.m49_code AS afs_m49_code,
-          scope.area_name,
+          scope.area_name AS afs_area_name,
           years.year AS afs_year,
           indicators.*
         FROM `{self._scope_table_fqn}` AS scope
