@@ -590,7 +590,7 @@ class ExportPipeline:
           FROM `{self._cfg_stage_table_fqn}`
           WHERE status IN ({statuses_literal})
         )
-        SELECT
+        # SELECT
           scope.m49_code AS afs_m49_code,
           scope.area_name AS afs_area_name,
           years.year AS afs_year,
@@ -624,7 +624,7 @@ class ExportPipeline:
 
         sql = (
             f"CREATE OR REPLACE TABLE `{self._scaffold_table_fqn}`\n"
-            f"CLUSTER BY afs_m49_code, afs_indicator_uid\nAS\n{scaffold_query}"
+            f"\nAS\n{scaffold_query}"
         )
         result = self._run_job(sql, count_table=self.scaffold_table_name)
         result["step"] = STEP_BUILD_SCAFFOLD_TABLE
