@@ -30,13 +30,14 @@ SRC workflow — `run_src()`
                               scaffold, no gap-filling, and no ORDER BY /
                               CLUSTER BY / PARTITION BY (performance
                               tuning comes later).
-  3. `export_src_to_gcs()`    Extract job: `exp_src_all_tbl` -> ONE Avro
-                              file, `{gcs_base_uri}/exp_src_all_tbl.avro`,
-                              overwritten on every run. Compression is
-                              BigQuery's default (none) unless
-                              `src_export_compression` is set.
+  3. `export_src_to_gcs()`    Extract job: `exp_src_all_tbl` -> Avro
+                              file(s) under
+                              `{gcs_base_uri}/exp_src_all_tbl/exp_src_all_tbl_*.avro`.
+                              Compressed by default
+                              (`src_export_compression="SNAPPY"`); pass
+                              `"DEFLATE"` or `None` to change that.
 
-STG workflow — `run_stg()`  (not reworked yet; still exports Parquet)
+STG workflow — `run_stg()`  (rest of the logic not reworked yet)
   1. `build_long_view()`       VIEW `exp_stg_all_long_vw`: UNION ALL of every
                                `stg_{code}_tbl`.
   2. `build_scaffold_table()`  TABLE `exp_ref_scaffold_cyi_tbl`: every
@@ -45,15 +46,23 @@ STG workflow — `run_stg()`  (not reworked yet; still exports Parquet)
                                JOIN long view (gap-filled; orphaned
                                long-view rows are kept, join keys are
                                COALESCEd).
-  4. `export_stg_to_gcs()`     Extract job: `exp_stg_all_long_tbl` -> ONE
-                               Parquet file,
-                               `{gcs_base_uri}/exp_stg_all_long_tbl.parquet`.
+  4. `export_stg_to_gcs()`     Extract job: `exp_stg_all_long_tbl` -> Avro
+                               file(s) under
+                               `{gcs_base_uri}/exp_stg_all_long_tbl/exp_stg_all_long_tbl_*.avro`.
+                               Avro, not Parquet, because the table has
+                               a JSON column that Parquet export can't
+                               handle. Compressed by default
+                               (`stg_export_compression="SNAPPY"`).
 
-Both exports use a BigQuery extract job (`extract_table`), not the
-EXPORT DATA statement, because EXPORT DATA only accepts a wildcard URI
-(sharded output). An extract job can write one fixed file, limited to
-1 GB of table data per file — if a table outgrows that, the job fails and
-the export has to move to a sharded (wildcard) form.
+Both exports use a BigQuery extract job (`extract_table`) with a
+wildcard destination URI, so BigQuery shards the output across as many
+files as the table needs — a table under ~1 GB still comes out as a
+single shard, a larger one is split automatically, and there's no size
+cap to hit either way. Each table gets its own subfolder so its shards
+don't mix with the other table's. An extract job only overwrites shard
+files it re-creates with the same name; if a run produces fewer shards
+than a previous, larger run did, the surplus old shards are left behind
+and have to be cleared out separately.
 
 Validation only checks table names: `cfg_stage_tbl` (and, for STG, the
 scope table) must exist; the expected `stg_*_vw` / `stg_*_tbl` objects are
@@ -137,7 +146,8 @@ class ExportPipeline:
         src_table_name: str = "exp_src_all_tbl",
         scaffold_table_name: str = "exp_ref_scaffold_cyi_tbl",
         start_year: int = 2010,
-        src_export_compression: Optional[str] = None,
+        src_export_compression: Optional[str] = "SNAPPY",
+        stg_export_compression: Optional[str] = "SNAPPY",
     ):
         self.bq_client = bq_client
         self.project_id = project_id
@@ -152,9 +162,13 @@ class ExportPipeline:
         self.src_table_name = src_table_name
         self.scaffold_table_name = scaffold_table_name
         self.start_year = start_year
-        # Avro compression for the src export. None = BigQuery's default
-        # (NONE, i.e. uncompressed). Avro supports "SNAPPY" or "DEFLATE".
+        # Avro compression for both exports (STG now exports Avro too,
+        # see export_stg_to_gcs). Defaults to "SNAPPY" so exports are
+        # compressed unless the caller opts out; the other supported
+        # value is "DEFLATE" (smaller but slower), and None falls back
+        # to BigQuery's own default (NONE, i.e. uncompressed).
         self.src_export_compression = src_export_compression
+        self.stg_export_compression = stg_export_compression
 
     # ------------------------------------------------------------------
     # Small helpers
@@ -195,13 +209,23 @@ class ExportPipeline:
     def _scaffold_table_fqn(self) -> str:
         return self._table_fqn(self.scaffold_table_name)
 
+    def _export_uri(self, table_name: str, extension: str) -> str:
+        """A table too large for a single-file extract needs a
+        wildcard URI so BigQuery can shard the output; each table gets
+        its own subfolder so its shards don't mix with another
+        table's. BigQuery replaces the `*` with a 12-digit shard
+        number (`{table_name}_000000000000.{extension}`, ...) — how
+        many shards depends on the table's size, not on anything set
+        here."""
+        return f"{self.gcs_base_uri.rstrip('/')}/{table_name}/{table_name}_*.{extension}"
+
     @property
     def _stg_all_export_uri(self) -> str:
-        return f"{self.gcs_base_uri.rstrip('/')}/{self.stg_all_table_name}.parquet"
+        return self._export_uri(self.stg_all_table_name, "avro")
 
     @property
     def _src_all_export_uri(self) -> str:
-        return f"{self.gcs_base_uri.rstrip('/')}/{self.src_table_name}.avro"
+        return self._export_uri(self.src_table_name, "avro")
 
     @staticmethod
     def _stg_tbl_name(afs_source_code: str) -> str:
@@ -365,12 +389,15 @@ class ExportPipeline:
         destination_format: str,
         compression: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Runs one BigQuery extract job (table -> ONE file at `uri`).
-        Same never-raises contract as _run_job(): failures are captured
-        in the returned dict. An extract job overwrites an existing
-        file at the same URI. `compression=None` leaves the option
-        unset, i.e. BigQuery's default (NONE). rows_affected is the
-        table's num_rows, since the extract can't change the row count.
+        """Runs one BigQuery extract job (table -> the shard(s) at the
+        wildcard `uri`). Same never-raises contract as _run_job():
+        failures are captured in the returned dict. An extract job
+        only overwrites shard files it re-creates with the same name —
+        if a later run produces fewer shards than an earlier one, the
+        surplus old shards are left behind and have to be cleared
+        separately. `compression=None` leaves the option unset, i.e.
+        BigQuery's default (NONE). rows_affected is the table's
+        num_rows, since the extract can't change the row count.
         """
         result: Dict[str, Any] = {
             "job_status": "FAILED",
@@ -411,9 +438,10 @@ class ExportPipeline:
         if not confirm_apply:
             print(
                 f"[DRY RUN] {method_name}(): would extract `{table_name}` to '{uri}' "
-                f"(single {destination_format} file, compression="
-                f"{compression or 'BigQuery default (NONE)'}, overwritten if it exists). "
-                f"Set confirm_apply=True to execute."
+                f"(sharded {destination_format} files, compression="
+                f"{compression or 'BigQuery default (NONE)'}; existing shards with the "
+                f"same name are overwritten, but not deleted if this run produces fewer "
+                f"of them). Set confirm_apply=True to execute."
             )
             return {
                 "table_name": table_name,
@@ -562,20 +590,25 @@ class ExportPipeline:
         return result
 
     # ------------------------------------------------------------------
-    # SRC step 3 — export exp_src_all_tbl to GCS (single Avro file)
+    # SRC step 3 — export exp_src_all_tbl to GCS (sharded Avro files)
     # ------------------------------------------------------------------
 
     def export_src_to_gcs(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """Exports exp_src_all_tbl as ONE Avro file at
-        `{gcs_base_uri}/{src_table_name}.avro` (overwritten on every
-        run). Requires build_src_all_table() to have been run.
+        """Exports exp_src_all_tbl as Avro file(s) under
+        `{gcs_base_uri}/{src_table_name}/{src_table_name}_*.avro`.
+        Requires build_src_all_table() to have been run.
 
-        Uses an extract job (not EXPORT DATA, which requires a wildcard
-        URI); single-file extracts are capped at 1 GB of table data —
-        the job fails beyond that. Compression is BigQuery's default
-        (NONE) unless src_export_compression is set to "SNAPPY" or
-        "DEFLATE". Avro logical types are left at BigQuery's default
-        (off), so e.g. TIMESTAMP columns are written as raw long values.
+        Uses an extract job (not EXPORT DATA, which requires the same
+        kind of wildcard URI). The `*` lets BigQuery shard the output
+        across as many files as the table needs instead of capping it
+        at 1 GB in a single file; a small table still comes out as one
+        shard. Existing shards are overwritten by name, but a run that
+        needs fewer shards than a previous one leaves the extra old
+        ones behind. Compressed by default (src_export_compression=
+        "SNAPPY"); pass "DEFLATE" for smaller-but-slower, or None for
+        BigQuery's uncompressed default. Avro logical types are left at
+        BigQuery's default (off), so e.g. TIMESTAMP columns are written
+        as raw long values.
         """
         return self._export_one_table(
             "export_src_to_gcs", STEP_EXPORT_SRC_GCS,
@@ -606,7 +639,7 @@ class ExportPipeline:
         ])
 
     # ==================================================================
-    # STG WORKFLOW — long view + scaffold -> exp_stg_all_long_tbl -> Parquet
+    # STG WORKFLOW — long view + scaffold -> exp_stg_all_long_tbl -> Avro
     # (logic unchanged from before, apart from dropping the schema check;
     #  to be reworked after the SRC workflow)
     # ==================================================================
@@ -779,22 +812,26 @@ class ExportPipeline:
         return result
 
     # ------------------------------------------------------------------
-    # STG step 4 — export exp_stg_all_long_tbl to GCS (single Parquet file)
+    # STG step 4 — export exp_stg_all_long_tbl to GCS (sharded Avro files)
     # ------------------------------------------------------------------
 
     def export_stg_to_gcs(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """Exports exp_stg_all_long_tbl as ONE Parquet file at
-        `{gcs_base_uri}/{stg_all_table_name}.parquet` (overwritten on
-        every run). Requires build_stg_all_table() to have been run.
+        """Exports exp_stg_all_long_tbl as Avro file(s) under
+        `{gcs_base_uri}/{stg_all_table_name}/{stg_all_table_name}_*.avro`.
+        Requires build_stg_all_table() to have been run.
 
-        Uses an extract job (not EXPORT DATA, which requires a wildcard
-        URI); single-file extracts are capped at 1 GB of table data —
-        the job fails beyond that.
+        Same sharding/overwrite behaviour as export_src_to_gcs() — see
+        its docstring. Avro (not Parquet) because exp_stg_all_long_tbl
+        has a JSON column and Parquet export doesn't support the JSON
+        type ("Type JSON is not currently supported for parquet
+        exports"), whereas Avro maps it to a string. Compressed by
+        default (stg_export_compression="SNAPPY"); pass "DEFLATE" or
+        None like src_export_compression.
         """
         return self._export_one_table(
             "export_stg_to_gcs", STEP_EXPORT_STG_GCS,
             self.stg_all_table_name, self._stg_all_export_uri,
-            bigquery.DestinationFormat.PARQUET, None,
+            bigquery.DestinationFormat.AVRO, self.stg_export_compression,
             confirm_apply,
         )
 
