@@ -61,12 +61,12 @@ Configuration problems (missing `afs_source_code`, missing `download_url`, etc.)
 
 ### `py/stage_pipeline.py` — `StagePipeline`
 
-BigQuery-only executor for the staging stage. Reads `cfg_indicator_tbl`, groups indicator filter rules by `(stg_view, stg_tbl)`, and executes one BigQuery job per group. Has no knowledge of the Google Sheet side — that's handled entirely by `ConfigSheetSyncer`.
+BigQuery-only executor for the staging stage. Reads `cfg_indicator_tbl` (one row per indicator/source, with a `filter_string` column holding the ready-to-use SQL WHERE fragment), derives `stg_view`/`stg_tbl` from each row's `afs_source_code` (`stg_{afs_source_code}_vw` / `stg_{afs_source_code}_tbl`), groups indicators by that pair, and executes one BigQuery job per group. Has no knowledge of the Google Sheet side — that's handled entirely by `ConfigSheetSyncer`.
 
 Status lifecycle: `DRAFT → REVIEW` (via this class) `→ ACTIVE → INACTIVE → DELETED` (manual/human steps).
 
 - `update(confirm_apply=False, confirm_status_update=False)` — `DRAFT` rows only. Appends to (or creates) each `stg_tbl`; on success, promotes affected rows `DRAFT → REVIEW`.
-- `reconstruct(stg_view=None, confirm_apply=False)` — `ACTIVE`/`REVIEW`/`INACTIVE` rows. Always `CREATE OR REPLACE`, full rebuild; never touches status.
+- `reconstruct(afs_source_code=None, confirm_apply=False)` — `ACTIVE`/`REVIEW`/`INACTIVE` rows. Always `CREATE OR REPLACE`, full rebuild; never touches status.
 
 Both methods default to a dry-run preview and only execute once `confirm_apply=True` is passed. Every `(stg_view, stg_tbl)` group is logged independently, so one failing group doesn't block or roll back the others.
 

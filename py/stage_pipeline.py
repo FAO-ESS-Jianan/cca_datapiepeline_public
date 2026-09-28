@@ -36,12 +36,14 @@ Two entry points, matching two distinct operational flows:
                      status.
 
 Execution granularity is one BigQuery job per (stg_view, stg_tbl) group.
-A `stg_view` feeds exactly one `stg_tbl` and doesn't affect any other
-group, so this is effectively "one job per source": a failure in one
-group never blocks or rolls back another, and every group's outcome
-(success or failure) is logged independently to the log table, tagged
-with the list of `afs_uid` it covered so you can trace any row back to
-the run that touched it.
+`stg_view`/`stg_tbl` are not stored columns — they're derived from each
+row's `afs_source_code` as `stg_{afs_source_code}_vw` /
+`stg_{afs_source_code}_tbl`, so a `stg_view` feeds exactly one `stg_tbl`
+and doesn't affect any other group. This is effectively "one job per
+source": a failure in one group never blocks or rolls back another, and
+every group's outcome (success or failure) is logged independently to
+the log table, tagged with the list of `afs_uid` it covered so you can
+trace any row back to the run that touched it.
 
 Nothing is executed until `confirm_apply=True` is passed explicitly;
 calling `update()` / `reconstruct()` without it returns a preview
@@ -61,8 +63,7 @@ from google.api_core.exceptions import GoogleAPIError
 WriteMode = Literal["insert", "create", "create_or_replace"]
 
 REQUIRED_CFG_COLUMNS = {
-    "filter_key", "filter_opt", "filter_value",
-    "afs_uid", "src_idx", "stg_view", "stg_tbl", "status",
+    "afs_uid", "src_idx", "afs_source_code", "filter_string", "status",
 }
 
 # Cap stored error text so one long BigQuery error message can't blow up
@@ -207,22 +208,23 @@ class StagePipeline:
     def _load_cfg(
         self,
         statuses: List[str],
-        stg_view: Optional[str] = None,
+        afs_source_code: Optional[str] = None,
     ) -> pd.DataFrame:
         """Read cfg_indicator_tbl filtered by status (and optionally a
-        single stg_view). filter_value is expected to already be a valid
-        SQL fragment (e.g. "('a', 'b')" or "5"), so it's used as-is when
-        building the WHERE clause — no parsing here.
+        single afs_source_code). filter_string is expected to already be
+        a valid SQL WHERE-clause fragment (e.g. "col = 'a' AND other > 5"),
+        or blank/NULL for "no filter", so it's used as-is when building
+        the WHERE clause — no parsing here.
         """
         query = f"""
         SELECT *
         FROM `{self._config_table_fqn}`
         WHERE status IN UNNEST(@statuses)
-        {"AND stg_view = @stg_view" if stg_view else ""}
+        {"AND afs_source_code = @afs_source_code" if afs_source_code else ""}
         """
         params: List[Any] = [bigquery.ArrayQueryParameter("statuses", "STRING", statuses)]
-        if stg_view:
-            params.append(bigquery.ScalarQueryParameter("stg_view", "STRING", stg_view))
+        if afs_source_code:
+            params.append(bigquery.ScalarQueryParameter("afs_source_code", "STRING", afs_source_code))
 
         job_config = bigquery.QueryJobConfig(query_parameters=params)
         df_cfg = self.bq_client.query(query, job_config=job_config).to_dataframe()
@@ -244,7 +246,7 @@ class StagePipeline:
     def _format_value(val: Any) -> str:
         """Formats a scalar Python value into a valid SQL string literal
         or primitive. Used for values this class constructs itself (e.g.
-        afs_uid), not for filter_value, which is already a ready-to-use
+        afs_uid), not for filter_string, which is already a ready-to-use
         SQL fragment supplied by the config."""
         if val is None or pd.isna(val):
             return "NULL"
@@ -254,47 +256,54 @@ class StagePipeline:
         return str(val)
 
     @staticmethod
-    def _build_condition(key: str, opt: str, val: Any) -> str:
-        """Constructs a single SQL WHERE clause condition. val is taken
-        as-is: filter_value is expected to already be a valid SQL
-        fragment (e.g. "('a', 'b')" for an IN clause, or "5")."""
-        return f"{key} {opt} {val}"
+    def _stg_view_name(afs_source_code: str) -> str:
+        return f"stg_{afs_source_code}_vw"
+
+    @staticmethod
+    def _stg_tbl_name(afs_source_code: str) -> str:
+        return f"stg_{afs_source_code}_tbl"
 
     def _build_indicator_queries(self, df_cfg: pd.DataFrame) -> pd.DataFrame:
-        """One row per (afs_uid, src_idx, stg_view, stg_tbl) group: the
+        """One row per (afs_uid, src_idx, afs_source_code) group: the
         per-indicator SELECT that will later be UNION ALL'd together
         with the other indicators feeding the same stg_tbl.
+
+        Each cfg row is normally already one complete indicator/source
+        pairing — filter_string holds the full WHERE-clause fragment for
+        that row (blank/NULL means "no filter", i.e. select everything).
+        Rows are still grouped and AND-joined defensively in case a given
+        (afs_uid, src_idx, afs_source_code) ever ends up split across more
+        than one cfg row.
         """
-        empty_cols = ["afs_uid", "src_idx", "stg_view", "stg_tbl", "indicator_src_query"]
+        empty_cols = ["afs_uid", "src_idx", "afs_source_code", "stg_view", "stg_tbl", "indicator_src_query"]
         if df_cfg.empty:
             return pd.DataFrame(columns=empty_cols)
 
-        df = df_cfg.copy()
-        df["single_condition"] = df.apply(
-            lambda row: self._build_condition(row["filter_key"], row["filter_opt"], row["filter_value"]),
-            axis=1,
-        )
-
         results = []
-        group_cols = ["afs_uid", "src_idx", "stg_view", "stg_tbl"]
+        group_cols = ["afs_uid", "src_idx", "afs_source_code"]
 
-        for (uid, src_idx, stg_view, stg_tbl), group in df.groupby(group_cols, dropna=False):
-            conditions = group["single_condition"].tolist()
-            if not conditions:
-                continue
+        for (uid, src_idx, afs_source_code), group in df_cfg.groupby(group_cols, dropna=False):
+            conditions = [
+                str(v).strip()
+                for v in group["filter_string"].tolist()
+                if v is not None and not pd.isna(v) and str(v).strip()
+            ]
+
+            stg_view = self._stg_view_name(afs_source_code)
+            stg_tbl = self._stg_tbl_name(afs_source_code)
 
             formatted_uid = self._format_value(uid)
             select_clause = f"{formatted_uid} AS afs_indicator_uid, *"
-            where_clause = " AND ".join(conditions)
+            where_clause = f"\n    WHERE {' AND '.join(conditions)}" if conditions else ""
 
             sql_query = f"""(
     SELECT {select_clause}
-    FROM `{self._table_fqn(stg_view)}`
-    WHERE {where_clause}
+    FROM `{self._table_fqn(stg_view)}`{where_clause}
 )"""
             results.append({
                 "afs_uid": uid,
                 "src_idx": src_idx,
+                "afs_source_code": afs_source_code,
                 "stg_view": stg_view,
                 "stg_tbl": stg_tbl,
                 "indicator_src_query": sql_query,
@@ -520,25 +529,25 @@ class StagePipeline:
 
     def reconstruct(
         self,
-        stg_view: Optional[str] = None,
+        afs_source_code: Optional[str] = None,
         confirm_apply: bool = False,
     ) -> pd.DataFrame:
         """ACTIVE / REVIEW / INACTIVE rows only. Always CREATE OR REPLACE
         — the full stg_tbl is rebuilt from current source data, no
         appending. Never touches status.
 
-        stg_view=None rebuilds every (stg_view, stg_tbl) group found;
-        pass a specific stg_view to rebuild only the stg_tbl it feeds,
-        without affecting any other stg_tbl.
+        afs_source_code=None rebuilds every (stg_view, stg_tbl) group
+        found; pass a specific afs_source_code to rebuild only the
+        stg_tbl it feeds, without affecting any other stg_tbl.
 
         Nothing is executed until confirm_apply=True; calling this with
         the default returns a preview of the groups that would run.
         """
         self.validate()
 
-        df_cfg = self._load_cfg(statuses=["ACTIVE", "REVIEW", "INACTIVE"], stg_view=stg_view)
+        df_cfg = self._load_cfg(statuses=["ACTIVE", "REVIEW", "INACTIVE"], afs_source_code=afs_source_code)
         if df_cfg.empty:
-            scope = f"stg_view='{stg_view}'" if stg_view else "any status in (ACTIVE, REVIEW, INACTIVE)"
+            scope = f"afs_source_code='{afs_source_code}'" if afs_source_code else "any status in (ACTIVE, REVIEW, INACTIVE)"
             print(f"No cfg rows found for {scope}. Nothing to reconstruct.")
             return pd.DataFrame()
 
