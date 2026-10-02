@@ -449,9 +449,7 @@ class StagePipeline:
 
         sql = f"""
         UPDATE `{self._config_table_fqn}`
-        SET
-            status = 'REVIEW',
-            updated_at = FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S %Z', CURRENT_TIMESTAMP())
+        SET status = 'REVIEW'
         WHERE status = 'DRAFT' AND afs_uid IN UNNEST(@uids)
         """
         job_config = bigquery.QueryJobConfig(

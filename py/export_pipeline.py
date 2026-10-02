@@ -2,16 +2,16 @@
 """export_pipeline.py
 
 ExportPipeline — the BigQuery-only workflow that aggregates the per-source
-`stg_*_vw` views (raw, "unprocessed") and the `stg_*_tbl` tables
+`src_*_vw` views (raw, "unprocessed") and the `stg_*_tbl` tables
 (indicator-filtered, "processed") into two independent output tables and
 exports each of them to GCS.
 
 This runs strictly *after* `StagePipeline` has already built/refreshed
-the `stg_*_tbl` tables (and after the `stg_*_vw` views that feed them
-already exist) — this class never writes to a `stg_*` table or view,
-it only reads from them. It shares `cfg_stage_tbl` with `StagePipeline`
-(same table, read-only here too) but does not touch its `status`
-column and does not create or alter it.
+the `stg_*_tbl` tables (and after the `src_*_vw` views that feed them
+already exist) — this class never writes to a `stg_*` table or a `src_*`
+view, it only reads from them. It shares `cfg_stage_tbl` with
+`StagePipeline` (same table, read-only here too) but does not touch its
+`status` column and does not create or alter it.
 
 The pipeline is split into two independent workflows, each with its own
 `validate_*()` and `run_*()` entry point and its own step methods. Always
@@ -19,40 +19,45 @@ a full rebuild (no incremental mode); each `run_*()` runs its steps in
 order and stops at the first failure.
 
 SRC workflow — `run_src()`
-  1. `build_src_view()`       CREATE OR REPLACE VIEW `exp_src_all_vw`: UNION
-                              ALL of every `stg_{code}_vw` (the raw view
+  1. `build_src_view()`       CREATE OR REPLACE VIEW `exp_src_long_vw`: UNION
+                              ALL of every `src_{code}_vw` (the raw view
                               `stg_{code}_tbl` reads from, before any
                               indicator-level `filter_string`) whose
                               `afs_source_code` appears (non-null, any
-                              status) in `cfg_stage_tbl`.
-  2. `build_src_all_table()`  CREATE OR REPLACE TABLE `exp_src_all_tbl` as a
+                              status) in `cfg_stage_tbl`, filtered to
+                              `afs_year >= start_year`.
+  2. `build_src_table()`      CREATE OR REPLACE TABLE `exp_src_long_tbl` as a
                               straight `SELECT *` of the view — no
-                              scaffold, no gap-filling, and no ORDER BY /
+                              ref table, no gap-filling, and no ORDER BY /
                               CLUSTER BY / PARTITION BY (performance
                               tuning comes later).
-  3. `export_src_to_gcs()`    Extract job: `exp_src_all_tbl` -> Avro
+  3. `export_src_to_gcs()`    Extract job: `exp_src_long_tbl` -> Avro
                               file(s) under
-                              `{gcs_base_uri}/exp_src_all_tbl/exp_src_all_tbl_*.avro`.
+                              `{gcs_base_uri}/exp_src_long_tbl/exp_src_long_tbl_*.avro`.
                               Compressed by default
                               (`src_export_compression="SNAPPY"`); pass
                               `"DEFLATE"` or `None` to change that.
 
-STG workflow — `run_stg()`  (rest of the logic not reworked yet)
-  1. `build_long_view()`       VIEW `exp_stg_all_long_vw`: UNION ALL of every
-                               `stg_{code}_tbl`.
-  2. `build_scaffold_table()`  TABLE `exp_ref_scaffold_cyi_tbl`: every
-                               m49_code x year x ACTIVE/REVIEW indicator.
-  3. `build_stg_all_table()`   TABLE `exp_stg_all_long_tbl`: scaffold FULL
-                               JOIN long view (gap-filled; orphaned
-                               long-view rows are kept, join keys are
-                               COALESCEd).
-  4. `export_stg_to_gcs()`     Extract job: `exp_stg_all_long_tbl` -> Avro
-                               file(s) under
-                               `{gcs_base_uri}/exp_stg_all_long_tbl/exp_stg_all_long_tbl_*.avro`.
-                               Avro, not Parquet, because the table has
-                               a JSON column that Parquet export can't
-                               handle. Compressed by default
-                               (`stg_export_compression="SNAPPY"`).
+STG workflow — `run_stg()`
+  1. `build_ref_table()`      TABLE `exp_ref_area_indicator_year`: every
+                              scope area x every indicator row of
+                              `cfg_stage_tbl` with status REVIEW / ACTIVE /
+                              INACTIVE x the last `ref_years` years (this
+                              year and the 14 before it, by default).
+  2. `build_stg_view()`       VIEW `exp_stg_long_vw`: UNION ALL of every
+                              `stg_{code}_tbl`, filtered to
+                              `afs_year >= start_year`.
+  3. `build_stg_table()`      TABLE `exp_stg_long_tbl`: ref table FULL JOIN
+                              stg view on (afs_m49_code, afs_uid, afs_year)
+                              — gap-filled; orphaned stg rows are kept and
+                              the three join keys are COALESCEd.
+  4. `export_stg_to_gcs()`    Extract job: `exp_stg_long_tbl` -> Avro
+                              file(s) under
+                              `{gcs_base_uri}/exp_stg_long_tbl/exp_stg_long_tbl_*.avro`.
+                              Avro, not Parquet, because the table has
+                              a JSON column that Parquet export can't
+                              handle. Compressed by default
+                              (`stg_export_compression="SNAPPY"`).
 
 Both exports use a BigQuery extract job (`extract_table`) with a
 wildcard destination URI, so BigQuery shards the output across as many
@@ -60,12 +65,12 @@ files as the table needs — a table under ~1 GB still comes out as a
 single shard, a larger one is split automatically, and there's no size
 cap to hit either way. Each table gets its own subfolder so its shards
 don't mix with the other table's. An extract job only overwrites shard
-files it re-creates with the same name; if a run produces fewer shards
-than a previous, larger run did, the surplus old shards are left behind
+files it re-creates with the same name; if a run produces fewer shards than
+a previous, larger run did, the surplus old shards are left behind
 and have to be cleared out separately.
 
 Validation only checks table names: `cfg_stage_tbl` (and, for STG, the
-scope table) must exist; the expected `stg_*_vw` / `stg_*_tbl` objects are
+scope table) must exist; the expected `src_*_vw` / `stg_*_tbl` objects are
 looked up (missing ones are skipped with a warning, none found raises);
 the log table is created if it doesn't exist. There is no schema check:
 UNION ALL is positional, so every unioned view/table must have identical
@@ -86,49 +91,39 @@ from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError
 
 
-REQUIRED_CFG_STAGE_COLUMNS = {
-    "afs_uid", "afs_id", "afs_source_code", "status",
-    "afs_outcome_code", "afs_outcome_name",
-    "afs_theme_code", "afs_theme_name",
-    "afs_subtheme_code", "afs_subtheme_name",
-    "afs_indicator_code", "afs_indicator_name",
-}
-
-REQUIRED_SCOPE_COLUMNS = {"m49_code", "area_name"}
-
-# Which cfg_stage_tbl statuses count as "currently live" for the
-# indicator scaffold (build_scaffold_table) and the taxonomy-consistency
-# check. NOT used for stg_tbl/stg_vw discovery — those steps take every
-# non-null afs_source_code regardless of status, since a stg_tbl/stg_vw
-# can hold real data even for an indicator that isn't ACTIVE/REVIEW
-# right now, and both union views are meant to reflect everything
-# physically present, not just what's currently reviewed.
-ACTIVE_STATUSES = ["ACTIVE", "REVIEW"]
+# Which cfg_stage_tbl statuses go into the ref table
+# (build_ref_table). NOT used for stg_tbl / src_vw discovery — those
+# steps take every non-null afs_source_code regardless of status, since a
+# stg_tbl / src_vw can hold real data even for an indicator that isn't
+# live right now, and both union views are meant to reflect everything
+# physically present.
+REF_STATUSES = ["REVIEW", "ACTIVE", "INACTIVE"]
 
 # Same cap as StagePipeline — keeps one long BQ error message from
 # blowing up a log table row.
 MAX_ERROR_MESSAGE_LEN = 2000
 
-STEP_BUILD_LONG_VIEW = "BUILD_LONG_VIEW"
 STEP_BUILD_SRC_VIEW = "BUILD_SRC_VIEW"
-STEP_BUILD_SCAFFOLD_TABLE = "BUILD_SCAFFOLD_TABLE"
-STEP_BUILD_STG_ALL_TABLE = "BUILD_STG_ALL_TABLE"
 STEP_BUILD_SRC_TABLE = "BUILD_SRC_TABLE"
-STEP_EXPORT_STG_GCS = "EXPORT_STG_GCS"
 STEP_EXPORT_SRC_GCS = "EXPORT_SRC_GCS"
+STEP_BUILD_REF_TABLE = "BUILD_REF_TABLE"
+STEP_BUILD_STG_VIEW = "BUILD_STG_VIEW"
+STEP_BUILD_STG_TABLE = "BUILD_STG_TABLE"
+STEP_EXPORT_STG_GCS = "EXPORT_STG_GCS"
 
 
 class ExportPipeline:
     """The BigQuery-only pipeline that builds two independent output
-    tables — src (union of stg_*_vw) and stg (union of stg_*_tbl,
-    gap-filled) — and exports each to GCS. Each has its own
-    validate_*() / run_*() entry point (see the module docstring).
+    tables — src (union of src_*_vw) and stg (union of stg_*_tbl,
+    gap-filled against the ref table) — and exports each to GCS. Each
+    has its own validate_*() / run_*() entry point (see the module
+    docstring).
 
     All reads/writes are scoped to `{project_id}.{dataset_id}`, except
     the GCS export itself. This class only reads `cfg_stage_tbl`, the
-    `stg_*_tbl` tables and the `stg_*_vw` views — it never creates or
-    alters any of them; it owns only the two union views, the scaffold
-    table, the two output tables, and its own log table.
+    scope table, the `stg_*_tbl` tables and the `src_*_vw` views — it
+    never creates or alters any of them; it owns only the two union
+    views, the ref table, the two output tables, and its own log table.
     """
 
     def __init__(
@@ -140,12 +135,13 @@ class ExportPipeline:
         scope_table_name: str,
         log_table_name: str,
         gcs_base_uri: str,
-        long_view_name: str = "exp_stg_all_long_vw",
-        stg_all_table_name: str = "exp_stg_all_long_tbl",
-        src_view_name: str = "exp_src_all_vw",
-        src_table_name: str = "exp_src_all_tbl",
-        scaffold_table_name: str = "exp_ref_scaffold_cyi_tbl",
+        src_view_name: str = "exp_src_long_vw",
+        src_table_name: str = "exp_src_long_tbl",
+        stg_view_name: str = "exp_stg_long_vw",
+        stg_table_name: str = "exp_stg_long_tbl",
+        ref_table_name: str = "exp_ref_area_indicator_year",
         start_year: int = 2010,
+        ref_years: int = 15,
         src_export_compression: Optional[str] = "SNAPPY",
         stg_export_compression: Optional[str] = "SNAPPY",
     ):
@@ -156,17 +152,20 @@ class ExportPipeline:
         self.scope_table_name = scope_table_name
         self.log_table_name = log_table_name
         self.gcs_base_uri = gcs_base_uri
-        self.long_view_name = long_view_name
-        self.stg_all_table_name = stg_all_table_name
         self.src_view_name = src_view_name
         self.src_table_name = src_table_name
-        self.scaffold_table_name = scaffold_table_name
+        self.stg_view_name = stg_view_name
+        self.stg_table_name = stg_table_name
+        self.ref_table_name = ref_table_name
+        # Lower bound applied inside both union views (afs_year >= start_year).
         self.start_year = start_year
-        # Avro compression for both exports (STG now exports Avro too,
-        # see export_stg_to_gcs). Defaults to "SNAPPY" so exports are
-        # compressed unless the caller opts out; the other supported
-        # value is "DEFLATE" (smaller but slower), and None falls back
-        # to BigQuery's own default (NONE, i.e. uncompressed).
+        # Number of years in the ref table, counting back from the current
+        # year inclusive (15 -> current_year - 14 .. current_year).
+        self.ref_years = ref_years
+        # Avro compression for both exports. Defaults to "SNAPPY" so
+        # exports are compressed unless the caller opts out; the other
+        # supported value is "DEFLATE" (smaller but slower), and None
+        # falls back to BigQuery's own default (NONE, i.e. uncompressed).
         self.src_export_compression = src_export_compression
         self.stg_export_compression = stg_export_compression
 
@@ -190,14 +189,6 @@ class ExportPipeline:
         return self._table_fqn(self.log_table_name)
 
     @property
-    def _long_view_fqn(self) -> str:
-        return self._table_fqn(self.long_view_name)
-
-    @property
-    def _stg_all_table_fqn(self) -> str:
-        return self._table_fqn(self.stg_all_table_name)
-
-    @property
     def _src_view_fqn(self) -> str:
         return self._table_fqn(self.src_view_name)
 
@@ -206,8 +197,16 @@ class ExportPipeline:
         return self._table_fqn(self.src_table_name)
 
     @property
-    def _scaffold_table_fqn(self) -> str:
-        return self._table_fqn(self.scaffold_table_name)
+    def _stg_view_fqn(self) -> str:
+        return self._table_fqn(self.stg_view_name)
+
+    @property
+    def _stg_table_fqn(self) -> str:
+        return self._table_fqn(self.stg_table_name)
+
+    @property
+    def _ref_table_fqn(self) -> str:
+        return self._table_fqn(self.ref_table_name)
 
     def _export_uri(self, table_name: str, extension: str) -> str:
         """A table too large for a single-file extract needs a
@@ -220,12 +219,12 @@ class ExportPipeline:
         return f"{self.gcs_base_uri.rstrip('/')}/{table_name}/{table_name}_*.{extension}"
 
     @property
-    def _stg_all_export_uri(self) -> str:
-        return self._export_uri(self.stg_all_table_name, "avro")
+    def _src_export_uri(self) -> str:
+        return self._export_uri(self.src_table_name, "avro")
 
     @property
-    def _src_all_export_uri(self) -> str:
-        return self._export_uri(self.src_table_name, "avro")
+    def _stg_export_uri(self) -> str:
+        return self._export_uri(self.stg_table_name, "avro")
 
     @staticmethod
     def _stg_tbl_name(afs_source_code: str) -> str:
@@ -235,11 +234,11 @@ class ExportPipeline:
         return f"stg_{afs_source_code}_tbl"
 
     @staticmethod
-    def _stg_view_name(afs_source_code: str) -> str:
-        """Same naming rule as StagePipeline._stg_view_name — the raw,
-        per-source view that stg_{code}_tbl itself reads from, before
-        any indicator-level filter_string is applied."""
-        return f"stg_{afs_source_code}_vw"
+    def _src_view_name(afs_source_code: str) -> str:
+        """Same naming rule as StagePipeline's per-source raw view —
+        the view that stg_{code}_tbl itself reads from, before any
+        indicator-level filter_string is applied."""
+        return f"src_{afs_source_code}_vw"
 
     @staticmethod
     def _new_run_id() -> str:
@@ -262,8 +261,8 @@ class ExportPipeline:
 
     def _distinct_source_codes(self) -> List[str]:
         """Every non-null afs_source_code in cfg_stage_tbl — status is
-        deliberately ignored (see ACTIVE_STATUSES comment). Shared by
-        both _discover_stg_tables() and _discover_stg_views(), since
+        deliberately ignored (see REF_STATUSES comment). Shared by
+        both _discover_stg_tables() and _discover_src_views(), since
         they only differ in which naming rule they apply to each code.
         """
         sql = f"""
@@ -282,13 +281,16 @@ class ExportPipeline:
     def _log_table_schema() -> List[bigquery.SchemaField]:
         return [
             bigquery.SchemaField("run_id", "STRING"),
-            bigquery.SchemaField("step", "STRING"),           # BUILD_LONG_VIEW / BUILD_SRC_VIEW / BUILD_SCAFFOLD_TABLE / BUILD_STG_ALL_TABLE / BUILD_SRC_TABLE / EXPORT_STG_GCS / EXPORT_SRC_GCS
+            bigquery.SchemaField("step", "STRING"),           # BUILD_SRC_VIEW / BUILD_SRC_TABLE / EXPORT_SRC_GCS / BUILD_REF_TABLE / BUILD_STG_VIEW / BUILD_STG_TABLE / EXPORT_STG_GCS
             bigquery.SchemaField("object_name", "STRING"),    # view name / table name / gcs uri
             bigquery.SchemaField("job_status", "STRING"),     # SUCCESS / FAILED
             bigquery.SchemaField("error_message", "STRING"),
             bigquery.SchemaField("bq_job_id", "STRING"),
             bigquery.SchemaField("rows_affected", "INTEGER"),
-            bigquery.SchemaField("source_stg_tbls", "STRING", mode="REPEATED"),  # only set for BUILD_LONG_VIEW / BUILD_SRC_VIEW
+            # Names of the source objects unioned by the step (src_*_vw for
+            # BUILD_SRC_VIEW, stg_*_tbl for BUILD_STG_VIEW). Column name kept
+            # as-is so existing log tables stay compatible.
+            bigquery.SchemaField("source_stg_tbls", "STRING", mode="REPEATED"),
             bigquery.SchemaField("created_at", "TIMESTAMP"),
         ]
 
@@ -345,10 +347,10 @@ class ExportPipeline:
         """Existing stg_{code}_tbl tables (indicator-filtered)."""
         return self._discover_existing(self._stg_tbl_name, "stg_tbl")
 
-    def _discover_stg_views(self) -> List[str]:
-        """Existing stg_{code}_vw views (raw, before any indicator-level
+    def _discover_src_views(self) -> List[str]:
+        """Existing src_{code}_vw views (raw, before any indicator-level
         filter_string is applied)."""
-        return self._discover_existing(self._stg_view_name, "stg_vw")
+        return self._discover_existing(self._src_view_name, "src_vw")
 
     # ------------------------------------------------------------------
     # Shared job runner
@@ -507,78 +509,77 @@ class ExportPipeline:
             print(f"WARNING: failed to write {len(errors)} row(s) to {self.log_table_name}: {errors}")
 
     # ==================================================================
-    # SRC WORKFLOW — exp_src_all_vw -> exp_src_all_tbl -> Avro on GCS
+    # SRC WORKFLOW — exp_src_long_vw -> exp_src_long_tbl -> Avro on GCS
     # ==================================================================
 
     def validate_src(self) -> None:
         """Table-name checks only: cfg_stage_tbl exists, the log table
-        exists (created if not), and at least one expected stg_*_vw
+        exists (created if not), and at least one expected src_*_vw
         exists (missing ones are warned about and skipped)."""
         self._check_base_tables({})
-        views = self._discover_stg_views()
+        views = self._discover_src_views()
         if not views:
-            raise RuntimeError("No stg_*_vw found for the source codes in cfg_stage_tbl.")
-        print(f"{len(views)} stg_vw found.")
+            raise RuntimeError("No src_*_vw found for the source codes in cfg_stage_tbl.")
+        print(f"{len(views)} src_vw found.")
 
     # ------------------------------------------------------------------
-    # SRC step 1 — src view (union of stg_*_vw, unprocessed)
+    # SRC step 1 — src view (union of src_*_vw, unprocessed)
     # ------------------------------------------------------------------
 
-    def _build_src_view_query(self, stg_views: List[str]) -> str:
-        if not stg_views:
-            raise ValueError("No stg_vw available to union into the src view.")
-        selects = [f"SELECT * FROM `{self._table_fqn(v)}` WHERE afs_year >= {self.start_year}" for v in stg_views]
+    def _build_src_view_query(self, src_views: List[str]) -> str:
+        if not src_views:
+            raise ValueError("No src_vw available to union into the src view.")
+        selects = [f"SELECT * FROM `{self._table_fqn(v)}` WHERE afs_year >= {self.start_year}" for v in src_views]
         return "\nUNION ALL\n".join(selects)
 
     def build_src_view(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """CREATE OR REPLACE VIEW exp_src_all_vw as the UNION ALL of
-        every stg_vw found by _discover_stg_views() — the raw,
+        """CREATE OR REPLACE VIEW exp_src_long_vw as the UNION ALL of
+        every src_vw found by _discover_src_views() — the raw,
         per-source views (i.e. "unprocessed": before any indicator-level
-        filter_string is applied), as opposed to build_long_view()'s
-        indicator-filtered stg_tbl union. Same shape as build_long_view()
-        otherwise: always a full replace, no rows_affected
-        (view holds no data of its own). No schema check: UNION ALL is
-        positional, so every stg_vw must have identical columns in
-        identical order.
+        filter_string is applied), as opposed to build_stg_view()'s
+        indicator-filtered stg_tbl union. Always a full replace, no
+        rows_affected (a view holds no data of its own). No schema
+        check: UNION ALL is positional, so every src_vw must have
+        identical columns in identical order.
         """
-        stg_views = self._discover_stg_views()
-        union_query = self._build_src_view_query(stg_views)
+        src_views = self._discover_src_views()
+        union_query = self._build_src_view_query(src_views)
 
         if not confirm_apply:
             print(
-                f"[DRY RUN] build_src_view(): would union {len(stg_views)} stg_vw "
-                f"into `{self.src_view_name}`: {stg_views}. Set confirm_apply=True to execute."
+                f"[DRY RUN] build_src_view(): would union {len(src_views)} src_vw "
+                f"into `{self.src_view_name}`: {src_views}. Set confirm_apply=True to execute."
             )
-            return {"stg_views": stg_views, "sql": union_query}
+            return {"src_views": src_views, "sql": union_query}
 
         sql = f"CREATE OR REPLACE VIEW `{self._src_view_fqn}` AS\n{union_query}"
         result = self._run_job(sql)
         result["step"] = STEP_BUILD_SRC_VIEW
         result["object_name"] = self.src_view_name
-        result["source_stg_tbls"] = stg_views
+        result["source_stg_tbls"] = src_views
         return result
 
     # ------------------------------------------------------------------
-    # SRC step 2 — src_all table (straight materialization, no scaffold)
+    # SRC step 2 — src table (straight materialization, no ref table)
     # ------------------------------------------------------------------
 
-    def _build_src_all_table_query(self) -> str:
+    def _build_src_table_query(self) -> str:
         return f"SELECT * FROM `{self._src_view_fqn}`"
 
-    def build_src_all_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """CREATE OR REPLACE TABLE exp_src_all_tbl (no CLUSTER BY /
-        PARTITION BY for now). Unlike build_stg_all_table(), this is a straight materialization
-        of exp_src_all_vw — no scaffold, no FULL JOIN, no gap-filling —
-        so it holds what's physically present across every stg_vw
-        (from start_year onward, the lower bound exp_src_all_vw applies). Reads
-        exp_src_all_vw, so build_src_view() must already have been run
-        successfully. Always a full rebuild — no incremental mode.
+    def build_src_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
+        """CREATE OR REPLACE TABLE exp_src_long_tbl (no CLUSTER BY /
+        PARTITION BY for now). A straight materialization of
+        exp_src_long_vw — no ref table, no FULL JOIN, no gap-filling —
+        so it holds what's physically present across every src_vw
+        (from start_year onward, the lower bound exp_src_long_vw
+        applies). Reads exp_src_long_vw, so build_src_view() must
+        already have been run successfully. Always a full rebuild.
         """
-        final_query = self._build_src_all_table_query()
+        final_query = self._build_src_table_query()
 
         if not confirm_apply:
             print(
-                f"[DRY RUN] build_src_all_table(): would (re)build `{self.src_table_name}`. "
+                f"[DRY RUN] build_src_table(): would (re)build `{self.src_table_name}`. "
                 f"Set confirm_apply=True to execute."
             )
             return {"sql": final_query}
@@ -590,16 +591,15 @@ class ExportPipeline:
         return result
 
     # ------------------------------------------------------------------
-    # SRC step 3 — export exp_src_all_tbl to GCS (sharded Avro files)
+    # SRC step 3 — export exp_src_long_tbl to GCS (sharded Avro files)
     # ------------------------------------------------------------------
 
     def export_src_to_gcs(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """Exports exp_src_all_tbl as Avro file(s) under
+        """Exports exp_src_long_tbl as Avro file(s) under
         `{gcs_base_uri}/{src_table_name}/{src_table_name}_*.avro`.
-        Requires build_src_all_table() to have been run.
+        Requires build_src_table() to have been run.
 
-        Uses an extract job (not EXPORT DATA, which requires the same
-        kind of wildcard URI). The `*` lets BigQuery shard the output
+        Uses an extract job. The `*` lets BigQuery shard the output
         across as many files as the table needs instead of capping it
         at 1 GB in a single file; a small table still comes out as one
         shard. Existing shards are overwritten by name, but a run that
@@ -612,13 +612,13 @@ class ExportPipeline:
         """
         return self._export_one_table(
             "export_src_to_gcs", STEP_EXPORT_SRC_GCS,
-            self.src_table_name, self._src_all_export_uri,
+            self.src_table_name, self._src_export_uri,
             bigquery.DestinationFormat.AVRO, self.src_export_compression,
             confirm_apply,
         )
 
     def run_src(self, confirm_apply: bool = False) -> pd.DataFrame:
-        """build_src_view -> build_src_all_table -> export_src_to_gcs,
+        """build_src_view -> build_src_table -> export_src_to_gcs,
         stopping at the first failure. Calls validate_src() first.
         Nothing is executed until confirm_apply=True; by default this
         only validates and prints the plan (use each step's own dry run
@@ -627,21 +627,19 @@ class ExportPipeline:
 
         if not confirm_apply:
             print(
-                "[DRY RUN] run_src(): would run build_src_view -> build_src_all_table -> "
-                f"export_src_to_gcs() -> '{self._src_all_export_uri}'. Set confirm_apply=True to execute."
+                "[DRY RUN] run_src(): would run build_src_view -> build_src_table -> "
+                f"export_src_to_gcs() -> '{self._src_export_uri}'. Set confirm_apply=True to execute."
             )
             return pd.DataFrame()
 
         return self._run_sequence([
             ("build_src_view", self.build_src_view),
-            ("build_src_all_table", self.build_src_all_table),
+            ("build_src_table", self.build_src_table),
             ("export_src_to_gcs", self.export_src_to_gcs),
         ])
 
     # ==================================================================
-    # STG WORKFLOW — long view + scaffold -> exp_stg_all_long_tbl -> Avro
-    # (logic unchanged from before, apart from dropping the schema check;
-    #  to be reworked after the SRC workflow)
+    # STG WORKFLOW — ref table + stg view -> exp_stg_long_tbl -> Avro
     # ==================================================================
 
     def validate_stg(self) -> None:
@@ -656,172 +654,180 @@ class ExportPipeline:
         print(f"{len(tables)} stg_tbl found.")
 
     # ------------------------------------------------------------------
-    # STG step 1 — long view (union of stg_*_tbl, processed)
+    # STG step 1 — ref table (area x indicator x year)
     # ------------------------------------------------------------------
 
-    def _build_long_view_query(self, stg_tables: List[str]) -> str:
-        if not stg_tables:
-            raise ValueError("No stg_tbl available to union into the long view.")
-        selects = [f"SELECT * FROM `{self._table_fqn(t)}` WHERE afs_year >= {self.start_year}" for t in stg_tables]
-        return "\nUNION ALL\n".join(selects)
-
-    def build_long_view(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """CREATE OR REPLACE VIEW exp_stg_all_long_vw as the UNION ALL
-        of every stg_tbl found by _discover_stg_tables() (indicator-
-        filtered, i.e. "processed"). Always a full replace — a view
-        definition, not stored data, so there's no incremental mode to
-        speak of. rows_affected is left None here: a view holds no
-        data of its own to count.
-
-        No schema check: UNION ALL is positional, so every stg_tbl must
-        have identical columns in identical order.
+    def _build_ref_table_query(self) -> str:
+        """Every scope area x every indicator row of cfg_stage_tbl with
+        status REVIEW / ACTIVE / INACTIVE x the last `ref_years` years
+        (current year inclusive). The year range is computed fresh at
+        query time (EXTRACT(YEAR FROM CURRENT_DATE())), so it always
+        tracks the current year without needing code changes.
         """
-        stg_tables = self._discover_stg_tables()
-        union_query = self._build_long_view_query(stg_tables)
-
-        if not confirm_apply:
-            print(
-                f"[DRY RUN] build_long_view(): would union {len(stg_tables)} stg_tbl "
-                f"into `{self.long_view_name}`: {stg_tables}. Set confirm_apply=True to execute."
-            )
-            return {"stg_tables": stg_tables, "sql": union_query}
-
-        sql = f"CREATE OR REPLACE VIEW `{self._long_view_fqn}` AS\n{union_query}"
-        result = self._run_job(sql)
-        result["step"] = STEP_BUILD_LONG_VIEW
-        result["object_name"] = self.long_view_name
-        result["source_stg_tbls"] = stg_tables
-        return result
-
-    # ------------------------------------------------------------------
-    # STG step 2 — scaffold table
-    # ------------------------------------------------------------------
-
-    def _build_scaffold_query(self) -> str:
-        """m49_code x year(start_year..current_year) x ACTIVE/REVIEW
-        indicator. No ORDER BY (performance tuning comes later). Year
-        upper bound is computed fresh at query time
-        (EXTRACT(YEAR FROM CURRENT_DATE())), so it always tracks the
-        current year without needing code changes.
-        """
-        statuses_literal = ", ".join(f"'{s}'" for s in ACTIVE_STATUSES)
+        statuses_literal = ", ".join(f"'{s}'" for s in REF_STATUSES)
         return f"""
         WITH years AS (
-          SELECT year
-          FROM UNNEST(GENERATE_ARRAY({self.start_year}, EXTRACT(YEAR FROM CURRENT_DATE()))) AS year
+          SELECT year AS afs_year
+          FROM UNNEST(
+            GENERATE_ARRAY(
+              EXTRACT(YEAR FROM CURRENT_DATE()) - {self.ref_years - 1},
+              EXTRACT(YEAR FROM CURRENT_DATE())
+            )
+          ) AS year
+        ),
+        areas AS (
+          SELECT
+            m49_code AS afs_m49_code,
+            area_name AS afs_area_name
+          FROM `{self._scope_table_fqn}`
         ),
         indicators AS (
           SELECT DISTINCT
-            afs_uid AS afs_indicator_uid,
             afs_id,
-            afs_outcome_code, afs_outcome_name,
-            afs_theme_code, afs_theme_name,
-            afs_subtheme_code, afs_subtheme_name,
-            afs_indicator_code, afs_indicator_name
+            afs_uid,
+            afs_outcome_code,      afs_outcome_name,
+            afs_theme_code,        afs_theme_name,
+            afs_subtheme_code,     afs_subtheme_name,
+            afs_indicator_code,    afs_indicator_name,
+            afs_subindicator_code, afs_subindicator_name
           FROM `{self._cfg_stage_table_fqn}`
           WHERE status IN ({statuses_literal})
         )
         SELECT
-          scope.m49_code AS afs_m49_code,
-          scope.area_name AS afs_area_name,
-          years.year AS afs_year,
-          indicators.*
-        FROM `{self._scope_table_fqn}` AS scope
+          areas.*,
+          indicators.*,
+          years.afs_year
+        FROM indicators
+        CROSS JOIN areas
         CROSS JOIN years
-        CROSS JOIN indicators
+        ORDER BY afs_m49_code, afs_id, afs_year
         """
 
-    def build_scaffold_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """CREATE OR REPLACE TABLE exp_ref_scaffold_cyi_tbl: every
-        m49_code x year x ACTIVE/REVIEW-indicator combination.
-        Materialized on its own — this used to be an inline subquery
-        inside build_final_table()'s FULL JOIN; pulling it out means it
-        can be inspected directly and is computed once even though
-        build_stg_all_table() consumes it every run. Always a full
-        rebuild — no incremental mode. rows_affected comes from an
-        extra get_table() call after success, same reasoning as
-        StagePipeline: CREATE TABLE AS SELECT is DDL, so BigQuery
-        doesn't populate num_dml_affected_rows for it.
+    def build_ref_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
+        """CREATE OR REPLACE TABLE exp_ref_area_indicator_year: every
+        scope area x indicator (REVIEW / ACTIVE / INACTIVE) x year
+        combination. Materialized on its own so it can be inspected
+        directly and is computed once even though build_stg_table()
+        consumes it every run. Always a full rebuild. rows_affected
+        comes from an extra get_table() call after success: CREATE
+        TABLE AS SELECT is DDL, so BigQuery doesn't populate
+        num_dml_affected_rows for it.
         """
-        scaffold_query = self._build_scaffold_query()
+        ref_query = self._build_ref_table_query()
 
         if not confirm_apply:
             print(
-                f"[DRY RUN] build_scaffold_table(): would (re)build `{self.scaffold_table_name}`. "
+                f"[DRY RUN] build_ref_table(): would (re)build `{self.ref_table_name}`. "
                 f"Set confirm_apply=True to execute."
             )
-            return {"sql": scaffold_query}
+            return {"sql": ref_query}
 
-        sql = f"CREATE OR REPLACE TABLE `{self._scaffold_table_fqn}`\nAS\n{scaffold_query}"
-        result = self._run_job(sql, count_table=self.scaffold_table_name)
-        result["step"] = STEP_BUILD_SCAFFOLD_TABLE
-        result["object_name"] = self.scaffold_table_name
+        sql = f"CREATE OR REPLACE TABLE `{self._ref_table_fqn}`\nAS\n{ref_query}"
+        result = self._run_job(sql, count_table=self.ref_table_name)
+        result["step"] = STEP_BUILD_REF_TABLE
+        result["object_name"] = self.ref_table_name
         return result
 
     # ------------------------------------------------------------------
-    # STG step 3 — stg_all table (scaffold FULL JOIN long view, gap-filled)
+    # STG step 2 — stg view (union of stg_*_tbl, processed)
     # ------------------------------------------------------------------
 
-    def _build_stg_all_table_query(self) -> str:
-        """exp_ref_scaffold_cyi_tbl FULL JOIN exp_stg_all_long_vw. FULL
-        (not LEFT) so a long-view row with no matching scaffold
-        combination — wrong m49_code, a year after
-        current_year (years before start_year are already dropped by the union view), or an indicator no longer ACTIVE/REVIEW — still
-        surfaces instead of being dropped. The three join keys are
-        COALESCEd from both sides so a long-view-only row still carries
-        non-NULL keys (without this, those orphaned rows would come
-        through with NULL keys, since the scaffold side is all NULL).
-        """
-        return f"""
-        SELECT
-          COALESCE(scaffold.afs_m49_code, long_vw.afs_m49_code) AS afs_m49_code,
-          COALESCE(scaffold.afs_indicator_uid, long_vw.afs_indicator_uid) AS afs_indicator_uid,
-          COALESCE(scaffold.afs_year, long_vw.afs_year) AS afs_year,
-          scaffold.* EXCEPT (afs_m49_code, afs_indicator_uid, afs_year),
-          long_vw.* EXCEPT (afs_m49_code, afs_indicator_uid, afs_year)
-        FROM `{self._scaffold_table_fqn}` AS scaffold
-        FULL JOIN `{self._long_view_fqn}` AS long_vw
-          ON scaffold.afs_m49_code = long_vw.afs_m49_code
-          AND scaffold.afs_indicator_uid = long_vw.afs_indicator_uid
-          AND scaffold.afs_year = long_vw.afs_year
-        """
+    def _build_stg_view_query(self, stg_tables: List[str]) -> str:
+        if not stg_tables:
+            raise ValueError("No stg_tbl available to union into the stg view.")
+        selects = [f"SELECT * FROM `{self._table_fqn(t)}` WHERE afs_year >= {self.start_year}" for t in stg_tables]
+        return "\nUNION ALL\n".join(selects)
 
-    def build_stg_all_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """CREATE OR REPLACE TABLE exp_stg_all_long_tbl (no CLUSTER BY /
-        PARTITION BY for now). Reads exp_ref_scaffold_cyi_tbl
-        and exp_stg_all_long_vw, so build_scaffold_table() and
-        build_long_view() must already have been run successfully.
-        Always a full rebuild — no incremental mode. rows_affected
-        comes from an extra get_table() call after success, same
-        reasoning as StagePipeline: CREATE TABLE AS SELECT is DDL, so
-        BigQuery doesn't populate num_dml_affected_rows for it.
+    def build_stg_view(self, confirm_apply: bool = False) -> Dict[str, Any]:
+        """CREATE OR REPLACE VIEW exp_stg_long_vw as the UNION ALL of
+        every stg_tbl found by _discover_stg_tables() (indicator-
+        filtered, i.e. "processed"). Always a full replace, no
+        rows_affected (a view holds no data of its own). No schema
+        check: UNION ALL is positional, so every stg_tbl must have
+        identical columns in identical order.
         """
-        final_query = self._build_stg_all_table_query()
+        stg_tables = self._discover_stg_tables()
+        union_query = self._build_stg_view_query(stg_tables)
 
         if not confirm_apply:
             print(
-                f"[DRY RUN] build_stg_all_table(): would (re)build `{self.stg_all_table_name}`. "
+                f"[DRY RUN] build_stg_view(): would union {len(stg_tables)} stg_tbl "
+                f"into `{self.stg_view_name}`: {stg_tables}. Set confirm_apply=True to execute."
+            )
+            return {"stg_tables": stg_tables, "sql": union_query}
+
+        sql = f"CREATE OR REPLACE VIEW `{self._stg_view_fqn}` AS\n{union_query}"
+        result = self._run_job(sql)
+        result["step"] = STEP_BUILD_STG_VIEW
+        result["object_name"] = self.stg_view_name
+        result["source_stg_tbls"] = stg_tables
+        return result
+
+    # ------------------------------------------------------------------
+    # STG step 3 — stg table (ref table FULL JOIN stg view, gap-filled)
+    # ------------------------------------------------------------------
+
+    def _build_stg_table_query(self) -> str:
+        """exp_ref_area_indicator_year FULL JOIN exp_stg_long_vw on
+        (afs_m49_code, afs_uid, afs_year). FULL (not LEFT) so a stg
+        row with no matching ref combination — wrong m49_code, a year
+        outside the ref window (e.g. 2010-2011 when the ref window
+        starts in 2012), or an indicator whose status isn't
+        REVIEW/ACTIVE/INACTIVE — still surfaces instead of being
+        dropped. The three join keys are COALESCEd from both sides so a
+        stg-only row still carries non-NULL keys (without this, those
+        orphaned rows would come through with NULL keys, since the ref
+        side is all NULL). Column names on the two sides must not
+        overlap beyond the three keys.
+        """
+        return f"""
+        SELECT
+          COALESCE(ref.afs_m49_code, stg.afs_m49_code) AS afs_m49_code,
+          COALESCE(ref.afs_uid, stg.afs_uid) AS afs_uid,
+          COALESCE(ref.afs_year, stg.afs_year) AS afs_year,
+          ref.* EXCEPT (afs_m49_code, afs_uid, afs_year),
+          stg.* EXCEPT (afs_m49_code, afs_uid, afs_year)
+        FROM `{self._ref_table_fqn}` AS ref
+        FULL JOIN `{self._stg_view_fqn}` AS stg
+          ON ref.afs_m49_code = stg.afs_m49_code
+          AND ref.afs_uid = stg.afs_uid
+          AND ref.afs_year = stg.afs_year
+        """
+
+    def build_stg_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
+        """CREATE OR REPLACE TABLE exp_stg_long_tbl (no CLUSTER BY /
+        PARTITION BY for now). Reads exp_ref_area_indicator_year and
+        exp_stg_long_vw, so build_ref_table() and build_stg_view() must
+        already have been run successfully. Always a full rebuild.
+        rows_affected comes from an extra get_table() call after
+        success, same reasoning as build_ref_table().
+        """
+        final_query = self._build_stg_table_query()
+
+        if not confirm_apply:
+            print(
+                f"[DRY RUN] build_stg_table(): would (re)build `{self.stg_table_name}`. "
                 f"Set confirm_apply=True to execute."
             )
             return {"sql": final_query}
 
-        sql = f"CREATE OR REPLACE TABLE `{self._stg_all_table_fqn}`\nAS\n{final_query}"
-        result = self._run_job(sql, count_table=self.stg_all_table_name)
-        result["step"] = STEP_BUILD_STG_ALL_TABLE
-        result["object_name"] = self.stg_all_table_name
+        sql = f"CREATE OR REPLACE TABLE `{self._stg_table_fqn}`\nAS\n{final_query}"
+        result = self._run_job(sql, count_table=self.stg_table_name)
+        result["step"] = STEP_BUILD_STG_TABLE
+        result["object_name"] = self.stg_table_name
         return result
 
     # ------------------------------------------------------------------
-    # STG step 4 — export exp_stg_all_long_tbl to GCS (sharded Avro files)
+    # STG step 4 — export exp_stg_long_tbl to GCS (sharded Avro files)
     # ------------------------------------------------------------------
 
     def export_stg_to_gcs(self, confirm_apply: bool = False) -> Dict[str, Any]:
-        """Exports exp_stg_all_long_tbl as Avro file(s) under
-        `{gcs_base_uri}/{stg_all_table_name}/{stg_all_table_name}_*.avro`.
-        Requires build_stg_all_table() to have been run.
+        """Exports exp_stg_long_tbl as Avro file(s) under
+        `{gcs_base_uri}/{stg_table_name}/{stg_table_name}_*.avro`.
+        Requires build_stg_table() to have been run.
 
         Same sharding/overwrite behaviour as export_src_to_gcs() — see
-        its docstring. Avro (not Parquet) because exp_stg_all_long_tbl
+        its docstring. Avro (not Parquet) because exp_stg_long_tbl
         has a JSON column and Parquet export doesn't support the JSON
         type ("Type JSON is not currently supported for parquet
         exports"), whereas Avro maps it to a string. Compressed by
@@ -830,14 +836,14 @@ class ExportPipeline:
         """
         return self._export_one_table(
             "export_stg_to_gcs", STEP_EXPORT_STG_GCS,
-            self.stg_all_table_name, self._stg_all_export_uri,
+            self.stg_table_name, self._stg_export_uri,
             bigquery.DestinationFormat.AVRO, self.stg_export_compression,
             confirm_apply,
         )
 
     def run_stg(self, confirm_apply: bool = False) -> pd.DataFrame:
-        """build_long_view -> build_scaffold_table -> build_stg_all_table
-        -> export_stg_to_gcs, stopping at the first failure. Calls
+        """build_ref_table -> build_stg_view -> build_stg_table ->
+        export_stg_to_gcs, stopping at the first failure. Calls
         validate_stg() first. Nothing is executed until
         confirm_apply=True; by default this only validates and prints
         the plan."""
@@ -845,15 +851,15 @@ class ExportPipeline:
 
         if not confirm_apply:
             print(
-                "[DRY RUN] run_stg(): would run build_long_view -> build_scaffold_table -> "
-                f"build_stg_all_table -> export_stg_to_gcs() -> '{self._stg_all_export_uri}'. "
+                "[DRY RUN] run_stg(): would run build_ref_table -> build_stg_view -> "
+                f"build_stg_table -> export_stg_to_gcs() -> '{self._stg_export_uri}'. "
                 "Set confirm_apply=True to execute."
             )
             return pd.DataFrame()
 
         return self._run_sequence([
-            ("build_long_view", self.build_long_view),
-            ("build_scaffold_table", self.build_scaffold_table),
-            ("build_stg_all_table", self.build_stg_all_table),
+            ("build_ref_table", self.build_ref_table),
+            ("build_stg_view", self.build_stg_view),
+            ("build_stg_table", self.build_stg_table),
             ("export_stg_to_gcs", self.export_stg_to_gcs),
         ])
