@@ -70,9 +70,12 @@ files as the table needs — a table under ~1 GB still comes out as a
 single shard, a larger one is split automatically, and there's no size
 cap to hit either way. Each table gets its own subfolder so its shards
 don't mix with the other table's. An extract job only overwrites shard
-files it re-creates with the same name; if a run produces fewer shards than
-a previous, larger run did, the surplus old shards are left behind
-and have to be cleared out separately.
+files it re-creates with the same name; if a run produced fewer shards
+than a previous one, the surplus old shards would be left behind and get
+mixed into anything that reads the folder later. So by default
+(`clear_export_folder=True`) every existing object in the table's own
+subfolder (`{gcs_base_uri}/{table_name}/`) is deleted right before the
+extract job runs. Nothing outside that subfolder is touched.
 
 Validation only checks table names: `cfg_stage_tbl` (and, for STG, the
 scope table) must exist; the expected `src_*_vw` / `stg_*_tbl` objects are
@@ -149,6 +152,7 @@ class ExportPipeline:
         ref_years: int = 15,
         src_export_compression: Optional[str] = "SNAPPY",
         stg_export_compression: Optional[str] = "SNAPPY",
+        clear_export_folder: bool = True,
     ):
         self.bq_client = bq_client
         self.project_id = project_id
@@ -173,6 +177,10 @@ class ExportPipeline:
         # falls back to BigQuery's own default (NONE, i.e. uncompressed).
         self.src_export_compression = src_export_compression
         self.stg_export_compression = stg_export_compression
+        # Delete the old shards in `{gcs_base_uri}/{table_name}/` before
+        # each export, so a run that produces fewer shards than an earlier
+        # one can't leave stale shards behind (see module docstring).
+        self.clear_export_folder = clear_export_folder
 
     # ------------------------------------------------------------------
     # Small helpers
@@ -389,6 +397,35 @@ class ExportPipeline:
             result["error_message"] = self._format_error(exc)
         return result
 
+    def _export_folder(self, table_name: str):
+        """(bucket_name, prefix) of one table's export subfolder,
+        i.e. `{gcs_base_uri}/{table_name}/` split into its parts."""
+        base = self.gcs_base_uri.rstrip("/")
+        if not base.startswith("gs://"):
+            raise ValueError(f"gcs_base_uri must start with gs://, got '{self.gcs_base_uri}'")
+        bucket_name, _, path = base[len("gs://"):].partition("/")
+        prefix = f"{path}/{table_name}/" if path else f"{table_name}/"
+        return bucket_name, prefix
+
+    def _clear_export_folder(self, table_name: str) -> int:
+        """Deletes every object under `{gcs_base_uri}/{table_name}/`
+        (only that table's own subfolder) and returns how many were
+        deleted. Called right before the extract job when
+        clear_export_folder=True. Uses the BigQuery client's
+        credentials, so no extra auth is needed."""
+        from google.cloud import storage  # imported lazily: only needed for exports
+
+        bucket_name, prefix = self._export_folder(table_name)
+        client = storage.Client(
+            project=self.bq_client.project,
+            credentials=self.bq_client._credentials,
+        )
+        blobs = list(client.list_blobs(bucket_name, prefix=prefix))
+        if blobs:
+            client.bucket(bucket_name).delete_blobs(blobs)
+        print(f"Cleared {len(blobs)} old object(s) from gs://{bucket_name}/{prefix}")
+        return len(blobs)
+
     def _run_extract_job(
         self,
         table_name: str,
@@ -398,11 +435,13 @@ class ExportPipeline:
     ) -> Dict[str, Any]:
         """Runs one BigQuery extract job (table -> the shard(s) at the
         wildcard `uri`). Same never-raises contract as _run_job():
-        failures are captured in the returned dict. An extract job
-        only overwrites shard files it re-creates with the same name —
-        if a later run produces fewer shards than an earlier one, the
-        surplus old shards are left behind and have to be cleared
-        separately. `compression=None` leaves the option unset, i.e.
+        failures are captured in the returned dict. When
+        clear_export_folder=True, the table's export subfolder is
+        emptied first (an extract job only overwrites shard files it
+        re-creates with the same name, so fewer shards than last time
+        would otherwise leave stale ones behind); a failure while
+        clearing fails the step before anything is exported.
+        `compression=None` leaves the option unset, i.e.
         BigQuery's default (NONE). rows_affected is the table's
         num_rows, since the extract can't change the row count.
         """
@@ -415,6 +454,8 @@ class ExportPipeline:
         job = None
         try:
             table = self.bq_client.get_table(self._table_fqn(table_name))
+            if self.clear_export_folder:
+                self._clear_export_folder(table_name)
             job_config = bigquery.ExtractJobConfig(destination_format=destination_format)
             if compression:
                 job_config.compression = compression
@@ -446,15 +487,22 @@ class ExportPipeline:
             print(
                 f"[DRY RUN] {method_name}(): would extract `{table_name}` to '{uri}' "
                 f"(sharded {destination_format} files, compression="
-                f"{compression or 'BigQuery default (NONE)'}; existing shards with the "
-                f"same name are overwritten, but not deleted if this run produces fewer "
-                f"of them). Set confirm_apply=True to execute."
+                f"{compression or 'BigQuery default (NONE)'}; "
+                + (
+                    f"every existing object in gs://{'/'.join(self._export_folder(table_name))} "
+                    f"is deleted first"
+                    if self.clear_export_folder
+                    else "existing shards with the same name are overwritten, but extra old "
+                         "shards are NOT deleted (clear_export_folder=False)"
+                )
+                + "). Set confirm_apply=True to execute."
             )
             return {
                 "table_name": table_name,
                 "gcs_uri": uri,
                 "format": destination_format,
                 "compression": compression,
+                "clear_export_folder": self.clear_export_folder,
             }
 
         result = self._run_extract_job(table_name, uri, destination_format, compression)
@@ -571,7 +619,7 @@ class ExportPipeline:
     def _build_src_table_query(self) -> str:
         return (
             f"SELECT * FROM `{self._src_view_fqn}`\n"
-            "ORDER BY afs_m49_code, afs_source, afs_year"
+            "ORDER BY afs_m49_code, afs_source_code, afs_year"
         )
 
     def build_src_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
@@ -610,9 +658,9 @@ class ExportPipeline:
         Uses an extract job. The `*` lets BigQuery shard the output
         across as many files as the table needs instead of capping it
         at 1 GB in a single file; a small table still comes out as one
-        shard. Existing shards are overwritten by name, but a run that
-        needs fewer shards than a previous one leaves the extra old
-        ones behind. Compressed by default (src_export_compression=
+        shard. The table's export subfolder is emptied first (see
+        clear_export_folder), so the folder only ever holds the shards
+        of the latest export. Compressed by default (src_export_compression=
         "SNAPPY"); pass "DEFLATE" for smaller-but-slower, or None for
         BigQuery's uncompressed default. Avro logical types are left at
         BigQuery's default (off), so e.g. TIMESTAMP columns are written
