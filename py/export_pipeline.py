@@ -571,7 +571,7 @@ class ExportPipeline:
     def _build_src_table_query(self) -> str:
         return (
             f"SELECT * FROM `{self._src_view_fqn}`\n"
-            "ORDER BY afs_m49_code, afs_source_code, afs_year"
+            "ORDER BY afs_m49_code, afs_source, afs_year"
         )
 
     def build_src_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
