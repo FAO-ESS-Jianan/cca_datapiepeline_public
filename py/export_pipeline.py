@@ -28,7 +28,8 @@ SRC workflow — `run_src()`
                               `afs_year >= start_year`.
   2. `build_src_table()`      CREATE OR REPLACE TABLE `exp_src_long_tbl` as a
                               straight `SELECT *` of the view — no
-                              ref table, no gap-filling, and no ORDER BY /
+                              ref table, no gap-filling, ordered by
+                              afs_m49_code, afs_source_code, afs_year; no
                               CLUSTER BY / PARTITION BY (performance
                               tuning comes later).
   3. `export_src_to_gcs()`    Extract job: `exp_src_long_tbl` -> Avro
@@ -568,7 +569,10 @@ class ExportPipeline:
     # ------------------------------------------------------------------
 
     def _build_src_table_query(self) -> str:
-        return f"SELECT * FROM `{self._src_view_fqn}`"
+        return (
+            f"SELECT * FROM `{self._src_view_fqn}`\n"
+            "ORDER BY afs_m49_code, afs_source_code, afs_year"
+        )
 
     def build_src_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
         """CREATE OR REPLACE TABLE exp_src_long_tbl (no CLUSTER BY /
@@ -821,6 +825,7 @@ class ExportPipeline:
         FROM joined
         LEFT JOIN indicators
           ON joined.afs_uid = indicators.afs_uid
+        ORDER BY afs_m49_code, afs_id, afs_year
         """
 
     def build_stg_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
