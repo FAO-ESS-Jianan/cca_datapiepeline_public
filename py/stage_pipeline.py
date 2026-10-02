@@ -37,9 +37,15 @@ Two entry points, matching two distinct operational flows:
 
 Execution granularity is one BigQuery job per (stg_view, stg_tbl) group.
 `stg_view`/`stg_tbl` are not stored columns — they're derived from each
-row's `afs_source_code` as `stg_{afs_source_code}_vw` /
-`stg_{afs_source_code}_tbl`, so a `stg_view` feeds exactly one `stg_tbl`
-and doesn't affect any other group. This is effectively "one job per
+row's `afs_source_code` as `src_{afs_source_code}_vw` /
+`stg_{afs_source_code}_tbl`, so a source view feeds exactly one `stg_tbl`
+and doesn't affect any other group. (The key/column is still called
+`stg_view` in the plan and log table for backward compatibility, but the
+view it points to is the `src_*_vw` view.)
+
+Each cfg row is one sub_indicator: `afs_uid` identifies the
+sub_indicator, and every row written into a `stg_tbl` carries `afs_uid`
+(taken from the cfg row). This is effectively "one job per
 source": a failure in one group never blocks or rolls back another, and
 every group's outcome (success or failure) is logged independently to
 the log table, tagged with the list of `afs_uid` it covered so you can
@@ -257,7 +263,7 @@ class StagePipeline:
 
     @staticmethod
     def _stg_view_name(afs_source_code: str) -> str:
-        return f"stg_{afs_source_code}_vw"
+        return f"src_{afs_source_code}_vw"
 
     @staticmethod
     def _stg_tbl_name(afs_source_code: str) -> str:
@@ -265,10 +271,12 @@ class StagePipeline:
 
     def _build_indicator_queries(self, df_cfg: pd.DataFrame) -> pd.DataFrame:
         """One row per (afs_uid, src_idx, afs_source_code) group: the
-        per-indicator SELECT that will later be UNION ALL'd together
-        with the other indicators feeding the same stg_tbl.
+        per-sub_indicator SELECT that will later be UNION ALL'd together
+        with the other sub_indicators feeding the same stg_tbl. afs_uid
+        identifies the sub_indicator and is written to the stg_tbl as
+        the afs_uid column.
 
-        Each cfg row is normally already one complete indicator/source
+        Each cfg row is normally already one complete sub_indicator/source
         pairing — filter_string holds the full WHERE-clause fragment for
         that row (blank/NULL means "no filter", i.e. select everything).
         Rows are still grouped and AND-joined defensively in case a given
@@ -293,7 +301,7 @@ class StagePipeline:
             stg_tbl = self._stg_tbl_name(afs_source_code)
 
             formatted_uid = self._format_value(uid)
-            select_clause = f"{formatted_uid} AS afs_indicator_uid, *"
+            select_clause = f"{formatted_uid} AS afs_uid, *"
             where_clause = f"\n    WHERE {' AND '.join(conditions)}" if conditions else ""
 
             sql_query = f"""(
