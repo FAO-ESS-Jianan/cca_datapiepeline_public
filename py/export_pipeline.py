@@ -40,17 +40,21 @@ SRC workflow — `run_src()`
 
 STG workflow — `run_stg()`
   1. `build_ref_table()`      TABLE `exp_ref_area_indicator_year`: every
-                              scope area x every indicator row of
+                              scope area x every distinct `afs_uid` of
                               `cfg_stage_tbl` with status REVIEW / ACTIVE /
                               INACTIVE x the last `ref_years` years (this
                               year and the 14 before it, by default).
+                              Only `afs_uid` is carried for the indicator.
   2. `build_stg_view()`       VIEW `exp_stg_long_vw`: UNION ALL of every
                               `stg_{code}_tbl`, filtered to
                               `afs_year >= start_year`.
   3. `build_stg_table()`      TABLE `exp_stg_long_tbl`: ref table FULL JOIN
                               stg view on (afs_m49_code, afs_uid, afs_year)
                               — gap-filled; orphaned stg rows are kept and
-                              the three join keys are COALESCEd.
+                              the three join keys are COALESCEd. The
+                              indicator taxonomy columns (afs_id, outcome /
+                              theme / ... names and codes) are then LEFT
+                              JOINed from `cfg_stage_tbl` on `afs_uid`.
   4. `export_stg_to_gcs()`    Extract job: `exp_stg_long_tbl` -> Avro
                               file(s) under
                               `{gcs_base_uri}/exp_stg_long_tbl/exp_stg_long_tbl_*.avro`.
@@ -658,11 +662,14 @@ class ExportPipeline:
     # ------------------------------------------------------------------
 
     def _build_ref_table_query(self) -> str:
-        """Every scope area x every indicator row of cfg_stage_tbl with
+        """Every scope area x every distinct afs_uid of cfg_stage_tbl with
         status REVIEW / ACTIVE / INACTIVE x the last `ref_years` years
-        (current year inclusive). The year range is computed fresh at
-        query time (EXTRACT(YEAR FROM CURRENT_DATE())), so it always
-        tracks the current year without needing code changes.
+        (current year inclusive). Only afs_uid is carried for the
+        indicator side — the rest of the indicator taxonomy (afs_id,
+        outcome/theme/... codes and names) is joined back on afs_uid in
+        _build_stg_table_query(), after the FULL JOIN. The year range is
+        computed fresh at query time (EXTRACT(YEAR FROM CURRENT_DATE())),
+        so it always tracks the current year without needing code changes.
         """
         statuses_literal = ", ".join(f"'{s}'" for s in REF_STATUSES)
         return f"""
@@ -682,30 +689,23 @@ class ExportPipeline:
           FROM `{self._scope_table_fqn}`
         ),
         indicators AS (
-          SELECT DISTINCT
-            afs_id,
-            afs_uid,
-            afs_outcome_code,      afs_outcome_name,
-            afs_theme_code,        afs_theme_name,
-            afs_subtheme_code,     afs_subtheme_name,
-            afs_indicator_code,    afs_indicator_name,
-            afs_subindicator_code, afs_subindicator_name
+          SELECT DISTINCT afs_uid
           FROM `{self._cfg_stage_table_fqn}`
           WHERE status IN ({statuses_literal})
         )
         SELECT
           areas.*,
-          indicators.*,
+          indicators.afs_uid,
           years.afs_year
         FROM indicators
         CROSS JOIN areas
         CROSS JOIN years
-        ORDER BY afs_m49_code, afs_id, afs_year
+        ORDER BY afs_m49_code, afs_uid, afs_year
         """
 
     def build_ref_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
         """CREATE OR REPLACE TABLE exp_ref_area_indicator_year: every
-        scope area x indicator (REVIEW / ACTIVE / INACTIVE) x year
+        scope area x afs_uid (REVIEW / ACTIVE / INACTIVE) x year
         combination. Materialized on its own so it can be inspected
         directly and is computed once even though build_stg_table()
         consumes it every run. Always a full rebuild. rows_affected
@@ -769,29 +769,58 @@ class ExportPipeline:
 
     def _build_stg_table_query(self) -> str:
         """exp_ref_area_indicator_year FULL JOIN exp_stg_long_vw on
-        (afs_m49_code, afs_uid, afs_year). FULL (not LEFT) so a stg
-        row with no matching ref combination — wrong m49_code, a year
-        outside the ref window (e.g. 2010-2011 when the ref window
-        starts in 2012), or an indicator whose status isn't
-        REVIEW/ACTIVE/INACTIVE — still surfaces instead of being
-        dropped. The three join keys are COALESCEd from both sides so a
-        stg-only row still carries non-NULL keys (without this, those
-        orphaned rows would come through with NULL keys, since the ref
-        side is all NULL). Column names on the two sides must not
-        overlap beyond the three keys.
+        (afs_m49_code, afs_uid, afs_year), then LEFT JOIN the indicator
+        taxonomy from cfg_stage_tbl on afs_uid.
+
+        FULL (not LEFT) for the first join so a stg row with no matching
+        ref combination — wrong m49_code, a year outside the ref window
+        (e.g. 2010-2011 when the ref window starts in 2012), or an
+        indicator whose status isn't REVIEW/ACTIVE/INACTIVE — still
+        surfaces instead of being dropped. The three join keys are
+        COALESCEd from both sides so a stg-only row still carries
+        non-NULL keys (without this, those orphaned rows would come
+        through with NULL keys, since the ref side is all NULL).
+
+        The indicator columns (afs_id, outcome/theme/subtheme/indicator/
+        subindicator code + name) are attached afterwards by afs_uid, so
+        stg-only rows get them too (as long as their afs_uid has a
+        REVIEW/ACTIVE/INACTIVE row in cfg_stage_tbl). Column names must
+        not overlap between ref, stg and the indicator columns beyond the
+        join keys.
         """
+        statuses_literal = ", ".join(f"'{s}'" for s in REF_STATUSES)
         return f"""
+        WITH joined AS (
+          SELECT
+            COALESCE(ref.afs_m49_code, stg.afs_m49_code) AS afs_m49_code,
+            COALESCE(ref.afs_uid, stg.afs_uid) AS afs_uid,
+            COALESCE(ref.afs_year, stg.afs_year) AS afs_year,
+            ref.* EXCEPT (afs_m49_code, afs_uid, afs_year),
+            stg.* EXCEPT (afs_m49_code, afs_uid, afs_year)
+          FROM `{self._ref_table_fqn}` AS ref
+          FULL JOIN `{self._stg_view_fqn}` AS stg
+            ON ref.afs_m49_code = stg.afs_m49_code
+            AND ref.afs_uid = stg.afs_uid
+            AND ref.afs_year = stg.afs_year
+        ),
+        indicators AS (
+          SELECT DISTINCT
+            afs_id,
+            afs_uid,
+            afs_outcome_code,      afs_outcome_name,
+            afs_theme_code,        afs_theme_name,
+            afs_subtheme_code,     afs_subtheme_name,
+            afs_indicator_code,    afs_indicator_name,
+            afs_subindicator_code, afs_subindicator_name
+          FROM `{self._cfg_stage_table_fqn}`
+          WHERE status IN ({statuses_literal})
+        )
         SELECT
-          COALESCE(ref.afs_m49_code, stg.afs_m49_code) AS afs_m49_code,
-          COALESCE(ref.afs_uid, stg.afs_uid) AS afs_uid,
-          COALESCE(ref.afs_year, stg.afs_year) AS afs_year,
-          ref.* EXCEPT (afs_m49_code, afs_uid, afs_year),
-          stg.* EXCEPT (afs_m49_code, afs_uid, afs_year)
-        FROM `{self._ref_table_fqn}` AS ref
-        FULL JOIN `{self._stg_view_fqn}` AS stg
-          ON ref.afs_m49_code = stg.afs_m49_code
-          AND ref.afs_uid = stg.afs_uid
-          AND ref.afs_year = stg.afs_year
+          joined.*,
+          indicators.* EXCEPT (afs_uid)
+        FROM joined
+        LEFT JOIN indicators
+          ON joined.afs_uid = indicators.afs_uid
         """
 
     def build_stg_table(self, confirm_apply: bool = False) -> Dict[str, Any]:
