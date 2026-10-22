@@ -80,7 +80,7 @@ SELECT
   ))                                                            AS ATTRS,
 
   -- ===== AFS LOG & CONFIG =====
-  CAST(afs_source_code AS STRING)                               AS afs_source,
+  CAST(afs_source_code AS STRING)                               AS afs_source_code,
   CAST(afs_source_updated_at AS STRING)                         AS afs_source_updated_at,
   CAST(afs_source_ingested_at AS TIMESTAMP)                     AS afs_source_ingested_at,
   CAST(NULL AS STRING)                                          AS afs_source_priority
