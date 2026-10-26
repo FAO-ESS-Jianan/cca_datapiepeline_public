@@ -294,6 +294,42 @@ class UnsdSdgProcessor(BaseSourceProcessor):
         target_path = os.path.join(input_path, csv_files[0])
         return pl.scan_csv(target_path, infer_schema=False)
 
+
+class AgIncentivesProcessor(BaseSourceProcessor):
+    """Ag-Incentives 数据源。
+
+    解压后目录结构为 unzipped/2025/ 下有三个文件，只使用 Aggregated_NRA 2025.csv，
+    读取方式与默认 faostat 结构相同（全部按字符串读入，不做额外处理）。
+    这里递归查找目标文件，不依赖具体的子文件夹名。
+
+    注：源文件中 Year / REGIONFAOCODE 等整数代码列本身就带 ".0"（如 2005.0），
+    source 阶段保持原样，留给下游清洗阶段处理。
+    数据更新年份后（如 Aggregated_NRA 2026.csv），需要同步修改 TARGET_FILENAME。
+    """
+
+    TARGET_FILENAME = "Aggregated_NRA 2025.csv"
+
+    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
+        if not os.path.isdir(input_path):
+            # 理论上下载下来是 zip，这里兜底：如果直接给的就是文件，原样使用
+            return pl.scan_csv(input_path, infer_schema=False)
+
+        matches = [
+            os.path.join(root, f)
+            for root, _, files in os.walk(input_path)
+            for f in files
+            if f == self.TARGET_FILENAME
+        ]
+
+        if not matches:
+            raise FileNotFoundError(f"在 {input_path} 及其子目录中未找到 {self.TARGET_FILENAME}")
+        if len(matches) > 1:
+            raise RuntimeError(f"找到多个 {self.TARGET_FILENAME}，无法确定使用哪个: {matches}")
+
+        print(f"📄 使用文件: {matches[0]}")
+        return pl.scan_csv(matches[0], infer_schema=False)
+
+
 class CustomProcessor(BaseSourceProcessor):
     """目录下有多个 csv，需要纵向拼接。
 
@@ -326,5 +362,6 @@ AFS_SOURCE_PROCESSORS: Dict[str, Type[BaseSourceProcessor]] = defaultdict(
     {
         "wb_wdi": WbWdiProcessor,
         "unstats_sdg": UnsdSdgProcessor,
+        "agincentives": AgIncentivesProcessor,
     },
 )
