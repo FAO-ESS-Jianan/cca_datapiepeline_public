@@ -28,6 +28,7 @@ import time
 import shutil
 from datetime import datetime
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -55,6 +56,14 @@ class SourcePipeline:
         lazy_df = processor.read_and_transform(processor.resolve_input_path())
         ...
     """
+
+    # 部分站点（如 agincentives.org）会拦截 requests 默认的 python-requests UA，返回 403，
+    # 因此统一伪装成浏览器请求头。Referer 在 download() 里按下载地址的域名动态生成。
+    DEFAULT_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+        "Accept": "*/*",
+    }
 
     def __init__(
         self,
@@ -207,7 +216,12 @@ class SourcePipeline:
     def download(self, max_retries: int = 3) -> str:
         """下载原始文件到本地，带指数退避重试。本地已有非空文件会自动跳过——
         这一层缓存判断独立于 run() 的 force 参数，force 只影响 GCS 版本检查那一层，
-        想强制重新下载需要自己先删掉本地文件。"""
+        想强制重新下载需要自己先删掉本地文件。
+
+        - 请求统一带浏览器 User-Agent 和同域 Referer，避免被站点按 UA/防盗链拦截。
+        - 4xx 错误（403/404 等）是请求本身的问题，重试没有意义，直接抛出；
+          只有网络错误和 5xx 才会重试。
+        """
         code = self._require_afs_source_code()
         row = self._get_config_row()
         download_url = row["download_url"]
@@ -218,11 +232,14 @@ class SourcePipeline:
             print(f"📦 本地已存在该文件，跳过下载: {self.local_file_path}")
             return self.local_file_path
 
+        parsed = urlparse(download_url)
+        headers = {**self.DEFAULT_HEADERS, "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
+
         last_err: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
                 print(f"⬇️ 开始下载 (第 {attempt}/{max_retries} 次): {download_url}")
-                resp = requests.get(download_url, stream=True, timeout=30)
+                resp = requests.get(download_url, headers=headers, stream=True, timeout=30)
                 resp.raise_for_status()
 
                 total_size = int(resp.headers.get("content-length", 0))
@@ -238,9 +255,20 @@ class SourcePipeline:
 
             except (requests.RequestException, OSError) as e:
                 last_err = e
-                print(f"⚠️ 下载失败 (第 {attempt} 次): {e}")
                 if os.path.exists(self.local_file_path):
                     os.remove(self.local_file_path)
+
+                status_code = (
+                    e.response.status_code
+                    if isinstance(e, requests.HTTPError) and e.response is not None
+                    else None
+                )
+                if status_code is not None and 400 <= status_code < 500:
+                    raise RuntimeError(
+                        f"下载 '{code}' 失败 (HTTP {status_code})，客户端错误不再重试: {e}"
+                    ) from e
+
+                print(f"⚠️ 下载失败 (第 {attempt} 次): {e}")
                 if attempt < max_retries:
                     time.sleep(2 ** attempt)  # 指数退避: 2s, 4s, 8s...
 
