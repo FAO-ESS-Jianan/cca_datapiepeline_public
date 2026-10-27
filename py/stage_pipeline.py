@@ -249,6 +249,11 @@ class StagePipeline:
         a valid SQL WHERE-clause fragment (e.g. "col = 'a' AND other > 5"),
         or blank/NULL for "no filter", so it's used as-is when building
         the WHERE clause — no parsing here.
+
+        Rows whose afs_uid or afs_source_code is blank/NULL are skipped
+        (with a printed warning listing them), so both update() and
+        reconstruct() only ever operate on rows that have a uid. See
+        _drop_rows_without_key.
         """
         query = f"""
         SELECT *
@@ -270,7 +275,48 @@ class StagePipeline:
         if missing:
             raise ValueError(f"cfg_indicator_tbl is missing required columns: {missing}")
 
-        return df_cfg
+        return self._drop_rows_without_key(df_cfg)
+
+    @staticmethod
+    def _is_blank(val: Any) -> bool:
+        """True for None / NaN / NA / empty or whitespace-only strings."""
+        if val is None:
+            return True
+        try:
+            if pd.isna(val):
+                return True
+        except (TypeError, ValueError):
+            pass
+        return isinstance(val, str) and not val.strip()
+
+    def _drop_rows_without_key(self, df_cfg: pd.DataFrame) -> pd.DataFrame:
+        """Skip cfg rows that can't be processed safely:
+
+        - blank afs_uid: the uid is what's written into the stg_tbl and
+          what DRAFT -> REVIEW write-back matches on, so a blank one can't
+          be traced or promoted (and NaN uids break sorting/grouping).
+        - blank afs_source_code: no src_*_vw / stg_*_tbl can be derived.
+
+        Skipped rows are printed so they can be fixed in the config Sheet
+        and re-synced; they are never modified here (a skipped DRAFT row
+        stays DRAFT and will be picked up once it has a uid).
+        """
+        no_uid = df_cfg["afs_uid"].map(self._is_blank)
+        no_src = df_cfg["afs_source_code"].map(self._is_blank)
+        skip = no_uid | no_src
+
+        if skip.any():
+            show_cols = [c for c in ["afs_uid", "src_idx", "afs_source_code", "status", "filter_string"]
+                         if c in df_cfg.columns]
+            print(
+                f"WARNING: skipping {int(skip.sum())} cfg row(s) "
+                f"({int(no_uid.sum())} with blank afs_uid, "
+                f"{int((no_src & ~no_uid).sum())} with blank afs_source_code only). "
+                f"Fix them in the config Sheet and re-sync to include them:"
+            )
+            print(df_cfg.loc[skip, show_cols].to_string())
+
+        return df_cfg.loc[~skip].reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Step 2 — build the SQL plan (pure, no BQ writes)
@@ -574,7 +620,7 @@ class StagePipeline:
 
         df_cfg = self._load_cfg(statuses=["DRAFT"])
         if df_cfg.empty:
-            print("No DRAFT rows found in cfg_indicator_tbl. Nothing to update.")
+            print("No DRAFT rows with a non-blank afs_uid found in cfg_indicator_tbl. Nothing to update.")
             return pd.DataFrame()
 
         plan = self._build_query_plan(df_cfg)
@@ -646,7 +692,7 @@ class StagePipeline:
         df_cfg = self._load_cfg(statuses=["ACTIVE", "REVIEW", "INACTIVE"], afs_source_code=afs_source_code)
         if df_cfg.empty:
             scope = f"afs_source_code='{afs_source_code}'" if afs_source_code else "any status in (ACTIVE, REVIEW, INACTIVE)"
-            print(f"No cfg rows found for {scope}. Nothing to reconstruct.")
+            print(f"No cfg rows with a non-blank afs_uid found for {scope}. Nothing to reconstruct.")
             return pd.DataFrame()
 
         plan = self._build_query_plan(df_cfg)
