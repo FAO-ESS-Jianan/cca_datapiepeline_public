@@ -327,11 +327,22 @@ class StagePipeline:
         """Formats a scalar Python value into a valid SQL string literal
         or primitive. Used for values this class constructs itself (e.g.
         afs_uid), not for filter_string, which is already a ready-to-use
-        SQL fragment supplied by the config."""
+        SQL fragment supplied by the config.
+
+        Escaping follows GoogleSQL (BigQuery) string-literal rules: quotes
+        are escaped with a backslash (\\'), not doubled ('') — BigQuery
+        reads 'a''b' as two adjacent literals and rejects it. Backslashes
+        are escaped first so they aren't read as escape sequences, and raw
+        newlines are escaped because a '...' literal can't span lines."""
         if val is None or pd.isna(val):
             return "NULL"
         if isinstance(val, str):
-            escaped = val.replace("'", "''")
+            escaped = (
+                val.replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+            )
             return f"'{escaped}'"
         return str(val)
 
