@@ -30,10 +30,11 @@ Two entry points, matching two distinct operational flows:
                      class ever performs, and it only ever runs
                      DRAFT -> REVIEW.
 
-- `reconstruct()` — status ACTIVE / REVIEW / INACTIVE. Rebuilds one or
-                     all `stg_tbl` from scratch (CREATE OR REPLACE) when
-                     an upstream data source has changed. Never touches
-                     status.
+- `reconstruct()` — status ACTIVE / REVIEW. Rebuilds one or all
+                     `stg_tbl` from scratch (CREATE OR REPLACE) when an
+                     upstream data source has changed. INACTIVE rows are
+                     not included, so their data drops out of the rebuilt
+                     table. Never touches status.
 
 Execution granularity is one BigQuery job per (stg_view, stg_tbl) group.
 `stg_view`/`stg_tbl` are not stored columns — they're derived from each
@@ -687,9 +688,10 @@ class StagePipeline:
         afs_source_code: Optional[str] = None,
         confirm_apply: bool = False,
     ) -> pd.DataFrame:
-        """ACTIVE / REVIEW / INACTIVE rows only. Always CREATE OR REPLACE
-        — the full stg_tbl is rebuilt from current source data, no
-        appending. Never touches status.
+        """ACTIVE / REVIEW rows only. Always CREATE OR REPLACE — the full
+        stg_tbl is rebuilt from current source data, no appending. INACTIVE
+        rows are excluded, so their data is dropped from the rebuilt
+        stg_tbl. Never touches status.
 
         afs_source_code=None rebuilds every (stg_view, stg_tbl) group
         found; pass a specific afs_source_code to rebuild only the
@@ -700,9 +702,9 @@ class StagePipeline:
         """
         self.validate()
 
-        df_cfg = self._load_cfg(statuses=["ACTIVE", "REVIEW", "INACTIVE"], afs_source_code=afs_source_code)
+        df_cfg = self._load_cfg(statuses=["ACTIVE", "REVIEW"], afs_source_code=afs_source_code)
         if df_cfg.empty:
-            scope = f"afs_source_code='{afs_source_code}'" if afs_source_code else "any status in (ACTIVE, REVIEW, INACTIVE)"
+            scope = f"afs_source_code='{afs_source_code}'" if afs_source_code else "any status in (ACTIVE, REVIEW)"
             print(f"No cfg rows with a non-blank afs_uid found for {scope}. Nothing to reconstruct.")
             return pd.DataFrame()
 
