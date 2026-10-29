@@ -61,12 +61,14 @@ Configuration problems (missing `afs_source_code`, missing `download_url`, etc.)
 
 ### `py/stage_pipeline.py` — `StagePipeline`
 
-BigQuery-only executor for the staging stage. Reads `cfg_indicator_tbl` (one row per indicator/source, with a `filter_string` column holding the ready-to-use SQL WHERE fragment), derives `stg_view`/`stg_tbl` from each row's `afs_source_code` (`stg_{afs_source_code}_vw` / `stg_{afs_source_code}_tbl`), groups indicators by that pair, and executes one BigQuery job per group. Has no knowledge of the Google Sheet side — that's handled entirely by `ConfigSheetSyncer`.
+BigQuery-only executor for the staging stage. Reads `cfg_indicator_tbl` (one row per indicator/source, with a `filter_string` column holding the ready-to-use SQL WHERE fragment), derives `stg_view`/`stg_tbl` from each row's `afs_source_code` (`src_{afs_source_code}_vw` / `stg_{afs_source_code}_tbl`), groups indicators by that pair, and executes one BigQuery job per group. Has no knowledge of the Google Sheet side — that's handled entirely by `ConfigSheetSyncer`.
 
 Status lifecycle: `DRAFT → REVIEW` (via this class) `→ ACTIVE → INACTIVE → DELETED` (manual/human steps).
 
-- `update(confirm_apply=False, confirm_status_update=False)` — `DRAFT` rows only. Appends to (or creates) each `stg_tbl`; on success, promotes affected rows `DRAFT → REVIEW`.
-- `reconstruct(afs_source_code=None, confirm_apply=False)` — `ACTIVE`/`REVIEW`/`INACTIVE` rows. Always `CREATE OR REPLACE`, full rebuild; never touches status.
+- `validate()` — runs automatically on instantiation (call again only after re-syncing the config). Loads every cfg row except `INACTIVE`/`DELETED` and checks them together: status is `DRAFT`/`REVIEW`/`ACTIVE`, non-blank `afs_uid`/`afs_source_code`, unique `afs_uid`, and `src_{afs_source_code}_vw` exists. Invalid rows are printed and skipped; the rest are cached, and `update()`/`reconstruct()` run only those without re-validating.
+- `update(confirm_apply=False)` — `DRAFT` rows only. Creates each `stg_tbl` if missing; otherwise replaces those `afs_uid`'s rows (`DELETE` + `INSERT` in one transaction), so re-running never duplicates data. On success, promotes affected rows `DRAFT → REVIEW` (failed groups stay `DRAFT`).
+- `reconstruct(afs_source_code=None, confirm_apply=False)` — `ACTIVE`/`REVIEW`/`DRAFT` rows (`INACTIVE` excluded). Always `CREATE OR REPLACE`, full rebuild; on success, promotes affected `DRAFT` rows to `REVIEW`.
+- `find_unused_stg_tables()` — read-only. Lists `stg_*_tbl` tables that exist but aren't fed by any validated cfg row (all rows `INACTIVE`/`DELETED` or skipped), with row count and last-modified time.
 
 Both methods default to a dry-run preview and only execute once `confirm_apply=True` is passed. Every `(stg_view, stg_tbl)` group is logged independently, so one failing group doesn't block or roll back the others.
 
