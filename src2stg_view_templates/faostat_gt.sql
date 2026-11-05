@@ -68,7 +68,10 @@ SELECT
   ))                                                            AS SERIES,
 
   -- ===== Dimensions：按什么拆分 =====
-  JSON '{}'                                                     AS DIMS,
+  JSON_STRIP_NULLS(JSON_OBJECT(
+    'source_code', source_code,
+    'source', source
+  ))                                                            AS DIMS,
 
   -- ===== Attribute =====
   JSON_STRIP_NULLS(JSON_OBJECT(
