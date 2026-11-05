@@ -67,6 +67,8 @@ SELECT
   -- afs_value：数值；value：原始字符串（如 "<2.5"），无法转换的值 afs_value 为 NULL
   SAFE_CAST(value AS FLOAT64)                                   AS afs_value,
   CAST(value AS STRING)                                         AS value,
+  CAST(unit AS STRING)                                          AS afs_unit,
+  CAST(flag AS STRING)                                          AS afs_flag,
 
   -- ===== Geographical Reference =====
   JSON_STRIP_NULLS(JSON_OBJECT(
@@ -102,7 +104,6 @@ SELECT
   -- ===== AFS LOG & CONFIG =====
   CAST(afs_source_code AS STRING)                               AS afs_source_code,
   CAST(afs_source_updated_at AS STRING)                         AS afs_source_updated_at,
-  CAST(afs_source_ingested_at AS TIMESTAMP)                     AS afs_source_ingested_at,
-  CAST(NULL AS STRING)                                          AS afs_source_priority
+  CAST(afs_source_ingested_at AS TIMESTAMP)                     AS afs_source_ingested_at
 
 FROM joined
