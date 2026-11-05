@@ -348,6 +348,113 @@ class CustomProcessor(BaseSourceProcessor):
         return pl.concat(lazy_frames, how="vertical")
 
 
+class FishstatGlobalProductionProcessor(BaseSourceProcessor):
+    """FAO FishStat Global Production。
+
+    zip 解压后文件直接在目录下，只用其中三个：
+      - GLOBAL_PRODUCTION_raw_data (without aggregates).csv   主表
+      - GLOBAL_PRODUCTION_SPECIES_ATTRIBUTES.csv              按 SPECIES 关联
+      - GLOBAL_PRODUCTION_WATER_AREA_ATTRIBUTES.csv           按 WATER_AREA 关联
+
+    species 属性表里的 "Species"（物种名称）列会先改名为 species_name。
+    原因：属性表里同时有 "SPECIES"（join key）和 "Species"（名称），区分大小写时是
+    两列，但 finalize_to_parquet 里 slugify 之后都会变成 "species"，
+    会被自动改成 species / species_1，含义不清；提前改名可以避免。
+    """
+
+    MAIN_FILE = "GLOBAL_PRODUCTION_raw_data (without aggregates).csv"
+    SPECIES_FILE = "GLOBAL_PRODUCTION_SPECIES_ATTRIBUTES.csv"
+    WATER_AREA_FILE = "GLOBAL_PRODUCTION_WATER_AREA_ATTRIBUTES.csv"
+
+    SPECIES_KEY = "SPECIES"
+    WATER_AREA_KEY = "WATER_AREA"
+
+    # 属性表里需要改名的列：{旧名: 新名}
+    SPECIES_RENAME = {"Species": "species_name"}
+
+    # 水域属性表里需要去掉的列
+    WATER_AREA_DROP = ["Fishing Area"]
+
+    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
+        lf = pl.scan_csv(self._file(input_path, self.MAIN_FILE), infer_schema=False)
+        self._require_column(lf.collect_schema().names(), self.SPECIES_KEY, self.MAIN_FILE)
+        self._require_column(lf.collect_schema().names(), self.WATER_AREA_KEY, self.MAIN_FILE)
+
+        lf_species = self._load_lookup(
+            self._file(input_path, self.SPECIES_FILE),
+            key=self.SPECIES_KEY,
+            rename=self.SPECIES_RENAME,
+        )
+        lf = self._left_join_lookup(lf, lf_species, key=self.SPECIES_KEY, name=self.SPECIES_FILE)
+
+        lf_water = self._load_lookup(
+            self._file(input_path, self.WATER_AREA_FILE),
+            key=self.WATER_AREA_KEY,
+            drop=self.WATER_AREA_DROP,
+        )
+        lf = self._left_join_lookup(lf, lf_water, key=self.WATER_AREA_KEY, name=self.WATER_AREA_FILE)
+
+        return lf
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _file(input_path: str, filename: str) -> str:
+        path = os.path.join(input_path, filename)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"在 {input_path} 中未找到 {filename}，目录内容: {os.listdir(input_path)}")
+        return path
+
+    @staticmethod
+    def _require_column(columns, column: str, filename: str) -> None:
+        if column not in columns:
+            raise KeyError(f"{filename} 中未找到列 '{column}'，现有列: {list(columns)}")
+
+    def _load_lookup(
+        self,
+        path: str,
+        key: str,
+        rename: Optional[Dict[str, str]] = None,
+        drop: Optional[List[str]] = None,
+    ) -> pl.LazyFrame:
+        """读入属性表（体积小，直接 eager 读取）：先改名、去掉不需要的列，再按 key 去重，
+        防止属性表自身有重复 key 导致 left join 后主表行数膨胀。"""
+        df = pl.read_csv(path, infer_schema=False)
+        filename = os.path.basename(path)
+
+        if rename:
+            for old in rename:
+                self._require_column(df.columns, old, filename)
+            df = df.rename(rename)
+
+        if drop:
+            for col in drop:
+                self._require_column(df.columns, col, filename)
+            df = df.drop(drop)
+
+        self._require_column(df.columns, key, filename)
+
+        n_before = df.height
+        df = df.unique(subset=[key], keep="first", maintain_order=True)
+        if df.height < n_before:
+            print(f"⚠️ {filename} 按 '{key}' 去重: {n_before} -> {df.height} 行，该表存在重复 key，已保留第一条。")
+        return df.lazy()
+
+    @staticmethod
+    def _left_join_lookup(
+        lf_main: pl.LazyFrame, lf_lookup: pl.LazyFrame, key: str, name: str
+    ) -> pl.LazyFrame:
+        """按同名 key left join。属性表中与主表重名的非 key 列会被丢弃（以主表为准），并打印提示。"""
+        main_cols = set(lf_main.collect_schema().names())
+        lookup_cols = lf_lookup.collect_schema().names()
+
+        dropped = [c for c in lookup_cols if c != key and c in main_cols]
+        if dropped:
+            print(f"ℹ️ {name} 中与主表重名的列已忽略: {dropped}")
+
+        keep_cols = [c for c in lookup_cols if c == key or c not in main_cols]
+        return lf_main.join(lf_lookup.select(keep_cols), on=key, how="left")
+
+
 # ----------------------------------------------------------------------
 # 注册表：afs_source_code -> processor 类（不是实例）
 #
@@ -363,5 +470,6 @@ AFS_SOURCE_PROCESSORS: Dict[str, Type[BaseSourceProcessor]] = defaultdict(
         "wb_wdi": WbWdiProcessor,
         "unstats_sdg": UnsdSdgProcessor,
         "agincentives": AgIncentivesProcessor,
+        "fao_fishstat_globalproduction": FishstatGlobalProductionProcessor,
     },
 )
