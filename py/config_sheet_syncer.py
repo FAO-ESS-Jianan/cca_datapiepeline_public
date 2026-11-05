@@ -3,27 +3,23 @@
 Shared class for syncing a Google Sheet <-> BigQuery config table pair.
 
 Used by multiple Colab notebooks (e.g. the source-config sync notebook
-and the indicator/stage-config notebook) — each notebook does its own
-auth/client bootstrapping and env config, then instantiates
-`ConfigSheetSyncer` with the constructor arguments that fit its use case:
+and the stage-config notebook) — each notebook does its own auth/client
+bootstrapping and env config, then instantiates `ConfigSheetSyncer` with
+the constructor arguments that fit its use case. Both follow the same
+"edit main directly" workflow:
 
-    - tmp_sheet_name: leave as None for a "direct edit on main" workflow
-      (e.g. source config); pass a name to enable write_to_tmp_sheet() /
-      promote_tmp_to_main() as a human-review buffer (e.g. stage config).
+    pull (cfg_table -> Sheet) -> manual edit in Sheet -> push (Sheet -> cfg_table)
+
     - row_key_column: which column uniquely identifies a row, used when
       comparing Sheet vs. cfg_table rows in validate(). Defaults to
-      "code"; pass a different column (e.g. "afs_id") if that's not the
-      right key for a given sheet.
-    - process_fn: an optional (df) -> df hook accepted by
-      get_cfg_dataframe() / pull() / push(), for any use-case-specific
-      DataFrame processing. Keep that logic in the calling notebook, not
-      in this module — this class is meant to stay generic across configs.
+      "code"; pass a different column (e.g. "afs_source_code",
+      "afs_uid") if that's not the right key for a given sheet.
 
 See the class and method docstrings below for full details.
 """
 
 from datetime import datetime
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 import gspread
 import pandas as pd
@@ -36,24 +32,18 @@ class ConfigSheetSyncer:
     sync log.
 
     This is the SAME class used for both the "source" config sync and the
-    "stage" (indicator) config sync — the two use cases differ only in the
-    constructor arguments:
-        - tmp_sheet_name: source config doesn't use a tmp sheet (leave as
-          None, the default); stage config passes one, used as a
-          human-review buffer before overwriting main.
-        - row_key_column: which column uniquely identifies a row, used
-          when comparing Sheet vs. cfg_table row-by-row (source uses
-          "code"; stage uses "afs_id").
+    "stage" config sync — the two use cases differ only in the
+    constructor arguments (sheet/table names, and row_key_column, the
+    column that uniquely identifies a row when comparing Sheet vs.
+    cfg_table row-by-row).
 
     Each instance is bound to:
         - one worksheet (where a human edits config)
-        - one log worksheet (records this instance's pull/push/promote history)
+        - one log worksheet (records this instance's pull/push history)
         - one BigQuery native table (the landed config table)
-        - optionally, one tmp worksheet (a staging area for review before
-          overwriting main)
 
     Create multiple instances to manage different configs (source cfg,
-    stage/indicator cfg, ...) independently.
+    stage cfg, ...) independently.
     """
 
     # ------------------------------------------------------------------
@@ -69,7 +59,6 @@ class ConfigSheetSyncer:
         external_cfg_tbl_name: str,
         cfg_table_name: str,
         project_id: Optional[str] = None,
-        tmp_sheet_name: Optional[str] = None,
         row_key_column: str = "code",
     ):
         """
@@ -84,16 +73,10 @@ class ConfigSheetSyncer:
             main_sheet_name: worksheet name this instance edits, e.g. "main".
             log_sheet_name: this instance's dedicated log worksheet name.
             project_id: BQ project ID. Defaults to bq_client.project.
-            tmp_sheet_name: optional tmp worksheet name. If provided, this
-                instance supports write_to_tmp_sheet() / promote_tmp_to_main()
-                as a human-review buffer before overwriting main. If not
-                provided (default None), those two methods raise — this
-                instance is treated as having no tmp sheet, matching the
-                simpler source-config workflow that edits main directly.
             row_key_column: the column used as a unique row key when
                 comparing Sheet vs. cfg_table rows in validate(). Defaults
-                to "code" (source config); pass something like "afs_id"
-                for configs that use a different key.
+                to "code"; pass something like "afs_source_code" or
+                "afs_uid" for configs that use a different key.
         """
         self.sh = spreadsheet
         self.bq_client = bq_client
@@ -105,7 +88,6 @@ class ConfigSheetSyncer:
 
         self.main_sheet_name = main_sheet_name
         self.log_sheet_name = log_sheet_name
-        self.tmp_sheet_name = tmp_sheet_name
 
         # 1. Main worksheet handle. Intentionally NOT auto-created: if the
         #    name is wrong or the sheet doesn't exist, we want a loud error
@@ -113,15 +95,7 @@ class ConfigSheetSyncer:
         #    mistaken for real config data.
         self.main_ws = self.sh.worksheet(self.main_sheet_name)
 
-        # 2. Optional tmp worksheet — a scratch/review area, so it's fine
-        #    to auto-create it if missing.
-        self.tmp_ws = (
-            self._get_or_create_worksheet(self.tmp_sheet_name)
-            if self.tmp_sheet_name
-            else None
-        )
-
-        # 3. Log worksheet handle.
+        # 2. Log worksheet handle.
         self.log_ws = self._init_or_get_log_worksheet()
 
     # ------------------------------------------------------------------
@@ -136,19 +110,6 @@ class ConfigSheetSyncer:
     def ext_table_ref(self) -> str:
         """Fully-qualified external table reference, e.g. project.dataset.table_ext"""
         return f"{self.project_id}.{self.dataset_id}.{self.ext_table_name}"
-
-    def _get_or_create_worksheet(self, name: str, rows: int = 1000, cols: int = 26) -> gspread.Worksheet:
-        """Get a worksheet by name, creating an empty one if it doesn't exist.
-
-        Used for the tmp worksheet (a scratch area, safe to auto-create).
-        main_ws deliberately does NOT go through this helper — see the
-        comment in __init__.
-        """
-        try:
-            return self.sh.worksheet(name)
-        except gspread.exceptions.WorksheetNotFound:
-            print(f"Worksheet '{name}' not found. Creating an empty one.")
-            return self.sh.add_worksheet(title=name, rows=rows, cols=cols)
 
     def _init_or_get_log_worksheet(self) -> gspread.Worksheet:
         """[Internal] Get the log worksheet, creating it with headers if missing.
@@ -165,7 +126,7 @@ class ConfigSheetSyncer:
             )
             headers = [
                 "execution_time",
-                "direction",     # "pull" (tbl->Sheet), "push" (Sheet->tbl), or "promote" (tmp->main)
+                "direction",     # "pull" (tbl->Sheet) or "push" (Sheet->tbl)
                 "sheet_name",
                 "cfg_table",
                 "status",        # SUCCESS / FAILED / SKIPPED
@@ -175,7 +136,7 @@ class ConfigSheetSyncer:
             return log_ws
 
     def _log_sync(self, direction: str, status: str, detail: str = ""):
-        """Record one pull / push / promote log entry."""
+        """Record one pull / push log entry."""
         execution_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_row = [
             execution_time,
@@ -191,19 +152,10 @@ class ConfigSheetSyncer:
     # ------------------------------------------------------------------
     # Raw reads (no cleaning / indexing / filtering)
     # ------------------------------------------------------------------
-    def get_cfg_dataframe(
-        self,
-        process_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
-        raw_strings: bool = True,
-    ) -> pd.DataFrame:
-        """Read the main worksheet into a DataFrame.
+    def get_cfg_dataframe(self, raw_strings: bool = True) -> pd.DataFrame:
+        """Read the main worksheet into a DataFrame, with no processing.
 
         Args:
-            process_fn: optional custom processing hook, signature
-                (df: pd.DataFrame) -> pd.DataFrame. Not passed (default
-                None) means no processing — the DataFrame is returned as
-                read. Pass a different function each time you need
-                different processing; this class stays generic.
             raw_strings: if True (default), read every cell as a plain
                 string via get_all_values() (header = first row). This
                 avoids gspread's get_all_records(), which auto-casts
@@ -213,7 +165,7 @@ class ConfigSheetSyncer:
                 get_all_records() instead and let gspread infer types.
 
         Returns:
-            The (optionally processed) DataFrame.
+            The DataFrame as read from the Sheet.
         """
         if raw_strings:
             values = self.main_ws.get_all_values()
@@ -221,65 +173,11 @@ class ConfigSheetSyncer:
         else:
             records = self.main_ws.get_all_records()
             df = pd.DataFrame(records)
-
-        if process_fn is not None:
-            df = process_fn(df)
         return df
 
     def get_cfg_dataframe_from_bq(self) -> pd.DataFrame:
         """Query the full cfg_table (BQ) into a DataFrame, with no processing."""
         return self.bq_client.query(f"SELECT * FROM `{self.cfg_table_ref}`").result().to_dataframe()
-
-    # ------------------------------------------------------------------
-    # tmp sheet: optional human-review buffer before overwriting main
-    # ------------------------------------------------------------------
-    def write_to_tmp_sheet(self, df: pd.DataFrame):
-        """Full overwrite of the tmp worksheet with the given DataFrame.
-
-        Requires this instance to have been constructed with
-        tmp_sheet_name set; raises otherwise (e.g. the source-config
-        syncer, which edits main directly and has no tmp sheet).
-        """
-        if self.tmp_ws is None:
-            raise ValueError(
-                "This ConfigSheetSyncer instance has no tmp sheet configured "
-                "(tmp_sheet_name was not passed to __init__)."
-            )
-        output_data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-        self.tmp_ws.clear()
-        self.tmp_ws.update(output_data)
-        print(f"Wrote {len(df)} rows to tmp sheet '{self.tmp_sheet_name}'.")
-
-    def promote_tmp_to_main(self, confirm: bool = False):
-        """Full overwrite of main with tmp's current content.
-
-        Uses `confirm`, not `force`: this is a plain on/off gate for a
-        destructive action that has no validation step to skip (unlike
-        pull()/push(), which use `force` to skip an existing validation
-        step). Nothing happens unless confirm=True is passed explicitly,
-        after a human has reviewed the tmp sheet.
-
-        Requires this instance to have been constructed with
-        tmp_sheet_name set.
-        """
-        if self.tmp_ws is None:
-            raise ValueError(
-                "This ConfigSheetSyncer instance has no tmp sheet configured "
-                "(tmp_sheet_name was not passed to __init__)."
-            )
-        if not confirm:
-            print(
-                "promote_tmp_to_main skipped (confirm=False). "
-                "Review the tmp sheet, then call again with confirm=True."
-            )
-            return
-
-        tmp_data = self.tmp_ws.get_all_values()
-        self.main_ws.clear()
-        self.main_ws.update(tmp_data)
-        row_count = max(len(tmp_data) - 1, 0)
-        print(f"Promoted '{self.tmp_sheet_name}' -> '{self.main_sheet_name}' ({row_count} rows).")
-        self._log_sync("promote", "SUCCESS", detail=f"{row_count} rows")
 
     # ------------------------------------------------------------------
     # Validation
@@ -364,21 +262,13 @@ class ConfigSheetSyncer:
 
         return notes
 
-    def validate(
-        self,
-        process_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
-    ) -> dict:
+    def validate(self) -> dict:
         """Standalone pre-sync validation — can be called any time on its
         own. Performs no sync action.
 
         Checks:
             - hard_issues: is Sheet / cfg_table empty, blank/duplicate column names
             - notes: Sheet vs. cfg_table column structure and row-level differences
-
-        Args:
-            process_fn: optional custom processing hook, signature (df) -> df,
-                applied to sheet_df right after reading, before validation
-                and comparison. Not passed (default None) means no processing.
 
         Returns:
             {
@@ -390,7 +280,7 @@ class ConfigSheetSyncer:
         """
         print("[Validate] Starting validation ...")
 
-        sheet_df = self.get_cfg_dataframe(process_fn=process_fn)
+        sheet_df = self.get_cfg_dataframe()
         bq_df = self.get_cfg_dataframe_from_bq()
 
         hard_issues = []
@@ -424,11 +314,7 @@ class ConfigSheetSyncer:
     # ------------------------------------------------------------------
     # pull: cfg_table (BQ) -> Sheet
     # ------------------------------------------------------------------
-    def pull(
-        self,
-        force: bool = False,
-        process_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
-    ):
+    def pull(self, force: bool = False):
         """cfg_table -> Sheet (read everything, overwrite the worksheet).
 
         Workflow stage: before a human starts editing the Sheet, pull down
@@ -439,15 +325,11 @@ class ConfigSheetSyncer:
             force: True skips validation entirely and syncs directly.
                 False (default) calls validate() first, and aborts if
                 hard_issues are found.
-            process_fn: optional custom processing hook, signature
-                (df) -> df, only relevant when force=False (it's forwarded
-                into the internal validate() call, applied to the sheet_df
-                read there). Not passed (default None) means no processing.
         """
         if force:
             bq_df = self.get_cfg_dataframe_from_bq()
         else:
-            result = self.validate(process_fn=process_fn)
+            result = self.validate()
             if result["hard_issues"]:
                 self._log_sync("pull", "FAILED", detail="; ".join(result["hard_issues"]))
                 raise ValueError(f"pull() validation failed: {result['hard_issues']}")
@@ -459,7 +341,8 @@ class ConfigSheetSyncer:
         )
         try:
             df = bq_df.astype(object).where(pd.notnull(bq_df), "")
-            df = df.applymap(lambda v: str(v) if not isinstance(v, (str, int, float, bool)) else v)
+            # DataFrame.map (pandas >= 2.1) replaces the deprecated applymap.
+            df = df.map(lambda v: str(v) if not isinstance(v, (str, int, float, bool)) else v)
 
             values = [df.columns.tolist()] + df.values.tolist()
             self.main_ws.clear()
@@ -538,11 +421,7 @@ class ConfigSheetSyncer:
     # ------------------------------------------------------------------
     # push: Sheet -> external table -> cfg_table (BQ)
     # ------------------------------------------------------------------
-    def push(
-        self,
-        force: bool = False,
-        process_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
-    ):
+    def push(self, force: bool = False):
         """Sheet -> external table -> cfg_table (CREATE OR REPLACE; schema
         fully follows the Sheet).
 
@@ -560,14 +439,6 @@ class ConfigSheetSyncer:
         change) is unaffected, since the external table reads the Sheet
         live.
 
-        Note: the data push() actually writes to BQ comes from the
-        external table (a live pointer to the Sheet), not from any
-        process_fn-processed DataFrame — process_fn here only affects the
-        sheet_df used for validation/comparison inside push(). If you
-        need the processed result to actually land in cfg_table, edit
-        the Sheet itself first (e.g. via write_to_tmp_sheet +
-        promote_tmp_to_main), then push.
-
         Workflow stage: after a human finishes editing the Sheet, push
         it to cfg_table.
 
@@ -575,13 +446,9 @@ class ConfigSheetSyncer:
             force: True skips validation entirely and syncs directly.
                 False (default) calls validate() first, and aborts if
                 hard_issues are found.
-            process_fn: optional custom processing hook, signature
-                (df) -> df, only relevant when force=False (forwarded
-                into the internal validate() call). Not passed (default
-                None) means no processing.
         """
         if not force:
-            result = self.validate(process_fn=process_fn)
+            result = self.validate()
             if result["hard_issues"]:
                 self._log_sync("push", "FAILED", detail="; ".join(result["hard_issues"]))
                 raise ValueError(f"push() validation failed: {result['hard_issues']}")
