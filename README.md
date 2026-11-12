@@ -70,7 +70,7 @@ Status lifecycle: `DRAFT → REVIEW` (via this class) `→ ACTIVE → INACTIVE �
 - `reconstruct(afs_source_code=None, confirm_apply=False)` — `ACTIVE`/`REVIEW`/`DRAFT` rows (`INACTIVE` excluded). Always `CREATE OR REPLACE`, full rebuild; on success, promotes affected `DRAFT` rows to `REVIEW`.
 - `find_unused_stg_tables()` — read-only. Lists `stg_*_tbl` tables that exist but aren't fed by any validated cfg row (all rows `INACTIVE`/`DELETED` or skipped), with row count and last-modified time.
 
-Both methods default to a dry-run preview and only execute once `confirm_apply=True` is passed. Every `(stg_view, stg_tbl)` group is logged independently, so one failing group doesn't block or roll back the others.
+Both methods default to a dry-run preview and only execute once `confirm_apply=True` is passed. Groups write to different `stg_tbl`, so their BigQuery jobs run in parallel — up to `max_concurrency` at a time (default 10; `max_concurrency=1` runs them one after another). Each job is labelled `afs_pipeline=stage`, `afs_run_type`, `afs_run_id`, so a run can be found in `INFORMATION_SCHEMA.JOBS`. Every `(stg_view, stg_tbl)` group is logged independently, so one failing group doesn't block or roll back the others.
 
 ## Design notes
 

@@ -49,7 +49,9 @@ view it points to is the `src_*_vw` view.)
 Each cfg row is one sub_indicator: `afs_uid` identifies the
 sub_indicator, and every row written into a `stg_tbl` carries `afs_uid`
 (taken from the cfg row). This is effectively "one job per
-source": a failure in one group never blocks or rolls back another, and
+source". Groups never share a stg_tbl, so their jobs run in parallel (up
+to `max_concurrency` at a time): a failure in one group never blocks or
+rolls back another, and
 every group's outcome (success or failure) is logged independently to
 the log table, tagged with the list of `afs_uid` it covered so you can
 trace any row back to the run that touched it.
@@ -69,6 +71,8 @@ DataFrame of what *would* run, for review before committing.
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
@@ -102,6 +106,17 @@ PRE_PROCESS_COLUMN = "pre_process"
 # a log table row. Long enough to keep the useful part of the message;
 # anything past this is truncated with a marker rather than dropped.
 MAX_ERROR_MESSAGE_LEN = 2000
+
+# Groups write to different stg_tbl and don't depend on each other, so
+# update() / reconstruct() run several BigQuery jobs at once. This caps how
+# many are in flight (override per call with max_concurrency=; 1 runs them
+# one after another). Jobs beyond BigQuery's own concurrency limit would be
+# queued by BigQuery anyway; the cap just keeps one run from crowding out
+# other queries in the project.
+DEFAULT_MAX_CONCURRENCY = 10
+
+# How often running jobs are polled (job.done() — a free jobs.get call).
+POLL_INTERVAL_SECONDS = 2
 
 
 class StagePipeline:
@@ -524,19 +539,18 @@ class StagePipeline:
         ]]
 
     # ------------------------------------------------------------------
-    # Step 3 — execute one (stg_view, stg_tbl) group
+    # Step 3 — execute the plan: one BQ job per (stg_view, stg_tbl) group,
+    # several running at the same time
     # ------------------------------------------------------------------
 
-    def _execute_group(
+    def _group_sql(
         self,
         stg_tbl: str,
         src_query: str,
         write_mode: WriteMode,
         afs_uid_list: List[Any],
-    ) -> Dict[str, Any]:
-        """Run the BQ job for a single stg_tbl group. Never raises —
-        failures are captured and returned so the caller can keep going
-        with the remaining groups in the plan.
+    ) -> str:
+        """The statement that writes one group into its stg_tbl.
 
         'delete_insert' deletes the group's afs_uid from the stg_tbl and
         inserts them again, inside one transaction (rolled back on any
@@ -544,19 +558,12 @@ class StagePipeline:
         for the same afs_uid gives the same result as running it once —
         e.g. a row that was put back to DRAFT, or whose status write-back
         failed, is rewritten rather than duplicated.
-
-        rows_affected: for 'delete_insert' it's the INSERT statement's
-        num_dml_affected_rows, read from the script's child job. For
-        'create' / 'create_or_replace' that field is always None — CREATE
-        TABLE AS SELECT is DDL, not DML, so BigQuery doesn't populate it —
-        so we make one extra get_table() call after the job succeeds and
-        use the table's current num_rows instead.
         """
         full_table = f"`{self._table_fqn(stg_tbl)}`"
 
         if write_mode == "delete_insert":
             uids = ", ".join(self._format_value(u) for u in afs_uid_list)
-            sql = f"""BEGIN
+            return f"""BEGIN
   BEGIN TRANSACTION;
   DELETE FROM {full_table} WHERE afs_uid IN ({uids});
   INSERT INTO {full_table}
@@ -566,25 +573,33 @@ EXCEPTION WHEN ERROR THEN
   ROLLBACK TRANSACTION;
   RAISE USING MESSAGE = @@error.message;
 END;"""
-        elif write_mode == "create":
-            sql = f"CREATE TABLE {full_table}\nAS\n{src_query}"
-        elif write_mode == "create_or_replace":
-            sql = f"CREATE OR REPLACE TABLE {full_table}\nAS\n{src_query}"
-        else:
-            raise ValueError(f"Unknown write_mode: {write_mode}")
+        if write_mode == "create":
+            return f"CREATE TABLE {full_table}\nAS\n{src_query}"
+        if write_mode == "create_or_replace":
+            return f"CREATE OR REPLACE TABLE {full_table}\nAS\n{src_query}"
+        raise ValueError(f"Unknown write_mode: {write_mode}")
 
+    def _collect_group(self, job: bigquery.QueryJob, stg_tbl: str, write_mode: WriteMode) -> Dict[str, Any]:
+        """Wait for one submitted group job (returns at once if it has
+        already finished) and turn it into a result dict. Never raises —
+        failures are captured so the other groups keep going.
+
+        rows_affected: for 'delete_insert' it's the INSERT statement's
+        num_dml_affected_rows, read from the script's child job. For
+        'create' / 'create_or_replace' that field is always None — CREATE
+        TABLE AS SELECT is DDL, not DML, so BigQuery doesn't populate it —
+        so we make one extra get_table() call after the job succeeds and
+        use the table's current num_rows instead.
+        """
         result: Dict[str, Any] = {
             "job_status": "FAILED",
             "error_message": None,
-            "bq_job_id": None,
+            "bq_job_id": job.job_id,
             "rows_affected": None,
         }
-
-        job = None
         try:
-            job = self.bq_client.query(sql)
-            job.result()  # blocks until done; raises on job error
-            result["bq_job_id"] = job.job_id
+            job.result()  # raises on job error (and may retry the job itself)
+            result["bq_job_id"] = job.job_id  # can change if result() retried the job
             result["job_status"] = "SUCCESS"
 
             if write_mode == "delete_insert":
@@ -595,11 +610,112 @@ END;"""
                 table = self.bq_client.get_table(self._table_fqn(stg_tbl))
                 result["rows_affected"] = table.num_rows
         except (GoogleAPIError, Exception) as exc:  # noqa: BLE001 - broad on purpose, see docstring
-            if job is not None:
-                result["bq_job_id"] = job.job_id
+            result["bq_job_id"] = job.job_id
             result["error_message"] = self._format_error(exc)
-
         return result
+
+    @staticmethod
+    def _job_done(job: bigquery.QueryJob) -> bool:
+        """job.done() reloads the job state from BigQuery. If that status
+        call itself fails, report the job as done: _collect_group then
+        calls job.result(), which waits for it and records any error."""
+        try:
+            return job.done()
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _execute_plan(
+        self,
+        plan: pd.DataFrame,
+        run_id: str,
+        run_type: str,
+        max_concurrency: int,
+    ) -> List[Dict[str, Any]]:
+        """Run every group of the plan (needs a write_mode column), with up
+        to max_concurrency BigQuery jobs running at the same time.
+
+        Groups never share a stg_tbl (stg_tbl is derived 1:1 from
+        afs_source_code), so they can run in any order and at the same
+        time. client.query() only submits a job and returns; the jobs then
+        run on BigQuery's side while this loop polls job.done() and submits
+        the next group as soon as a slot frees up.
+
+        One failing group doesn't affect the others. Results come back in
+        plan order, whatever order the jobs finish in.
+
+        Ctrl+C / notebook interrupt: cancellation is requested for every
+        running job, groups not yet submitted are skipped, and all of them
+        are returned as FAILED, so the run is still logged and the groups
+        that did finish are still promoted. Every write is atomic (CREATE
+        [OR REPLACE] TABLE AS / a transaction), so a cancelled group leaves
+        its stg_tbl as it was — or, if the cancel came too late, fully
+        written; either way re-running is safe.
+        """
+        if max_concurrency < 1:
+            raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
+
+        rows = list(plan.itertuples(index=False))
+        total = len(rows)
+        results: Dict[int, Dict[str, Any]] = {}
+        pending = deque(range(total))
+        running: Dict[int, bigquery.QueryJob] = {}
+        job_config = bigquery.QueryJobConfig(labels={
+            "afs_pipeline": "stage",
+            "afs_run_type": run_type.lower(),
+            "afs_run_id": run_id,
+        })
+        started = time.monotonic()
+
+        def finish(i: int, res: Dict[str, Any]) -> None:
+            row = rows[i]
+            res.update(stg_view=row.stg_view, stg_tbl=row.stg_tbl, afs_uid_list=row.afs_uid_list)
+            results[i] = res
+            status = res["job_status"]
+            print(f"[{run_id}] ({len(results)}/{total}) {row.stg_tbl} -> {status}"
+                  + (f": {res['error_message']}" if status == "FAILED" else ""))
+
+        print(f"[{run_id}] {run_type}: {total} group(s), up to {max_concurrency} at a time.")
+        try:
+            while pending or running:
+                # Fill free slots.
+                while pending and len(running) < max_concurrency:
+                    i = pending.popleft()
+                    row = rows[i]
+                    try:
+                        sql = self._group_sql(row.stg_tbl, row.indicator_src_query,
+                                              row.write_mode, row.afs_uid_list)
+                        running[i] = self.bq_client.query(sql, job_config=job_config)
+                        print(f"[{run_id}] submitted {row.stg_view} -> {row.stg_tbl} ({row.write_mode})")
+                    except Exception as exc:  # noqa: BLE001 - one bad group mustn't stop the rest
+                        finish(i, {"job_status": "FAILED", "error_message": self._format_error(exc),
+                                   "bq_job_id": None, "rows_affected": None})
+
+                # Collect whatever has finished.
+                done = [i for i, job in running.items() if self._job_done(job)]
+                for i in done:
+                    finish(i, self._collect_group(running.pop(i), rows[i].stg_tbl, rows[i].write_mode))
+                if running and not done:
+                    time.sleep(POLL_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            print(f"[{run_id}] Interrupted: requesting cancellation of {len(running)} running "
+                  f"job(s), skipping {len(pending)} not yet submitted.")
+            for i, job in running.items():
+                try:
+                    job.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+                finish(i, {"job_status": "FAILED",
+                           "error_message": "Cancelled by user (cancel requested; the job may still "
+                                            "have completed — safe to re-run)",
+                           "bq_job_id": job.job_id, "rows_affected": None})
+            for i in pending:
+                finish(i, {"job_status": "FAILED", "error_message": "Not submitted (run interrupted)",
+                           "bq_job_id": None, "rows_affected": None})
+
+        n_ok = sum(r["job_status"] == "SUCCESS" for r in results.values())
+        print(f"[{run_id}] {run_type} finished in {time.monotonic() - started:.0f}s: "
+              f"{n_ok} succeeded, {total - n_ok} failed.")
+        return [results[i] for i in range(total)]
 
     # ------------------------------------------------------------------
     # Step 4 — logging (success and failure, always)
@@ -687,11 +803,18 @@ END;"""
     # Public entry point — UPDATE
     # ------------------------------------------------------------------
 
-    def update(self, confirm_apply: bool = False) -> pd.DataFrame:
+    def update(
+        self,
+        confirm_apply: bool = False,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    ) -> pd.DataFrame:
         """DRAFT rows only. For an existing stg_tbl, replaces each DRAFT
         afs_uid's rows (DELETE + INSERT in one transaction, see
-        _execute_group); creates the stg_tbl (CREATE TABLE AS) if it
+        _group_sql); creates the stg_tbl (CREATE TABLE AS) if it
         doesn't exist yet. Safe to re-run: nothing is ever duplicated.
+
+        Groups run in parallel, up to max_concurrency BigQuery jobs at a
+        time (1 = one after another); see _execute_plan.
 
         On success, promotes the affected afs_uid from DRAFT to REVIEW;
         DRAFT rows in failed groups stay DRAFT and are retried next run.
@@ -723,16 +846,7 @@ END;"""
             return self._preview(plan)
 
         run_id = self._new_run_id()
-        results: List[Dict[str, Any]] = []
-        for row in plan.itertuples(index=False):
-            print(f"[{run_id}] UPDATE {row.stg_view} -> {row.stg_tbl} ({row.write_mode})...")
-            res = self._execute_group(row.stg_tbl, row.indicator_src_query, row.write_mode, row.afs_uid_list)
-            res["stg_view"] = row.stg_view
-            res["stg_tbl"] = row.stg_tbl
-            res["afs_uid_list"] = row.afs_uid_list
-            results.append(res)
-            status = res["job_status"]
-            print(f"  -> {status}" + (f": {res['error_message']}" if status == "FAILED" else ""))
+        results = self._execute_plan(plan, run_id, "UPDATE", max_concurrency)
 
         self._write_log(run_id, "UPDATE", results)
 
@@ -754,11 +868,15 @@ END;"""
         self,
         afs_source_code: Optional[str] = None,
         confirm_apply: bool = False,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ) -> pd.DataFrame:
         """ACTIVE / REVIEW / DRAFT rows only. Always CREATE OR REPLACE —
         the full stg_tbl is rebuilt from current source data, no
         appending. INACTIVE rows are excluded, so their data is dropped
         from the rebuilt stg_tbl.
+
+        Groups run in parallel, up to max_concurrency BigQuery jobs at a
+        time (1 = one after another); see _execute_plan.
 
         On success, the DRAFT afs_uid in each successfully rebuilt group
         are promoted to REVIEW. ACTIVE / REVIEW rows keep their status,
@@ -784,24 +902,16 @@ END;"""
             print("No valid (stg_view, stg_tbl) groups could be built from the selected rows.")
             return pd.DataFrame()
 
+        plan = plan.copy()
+        plan["write_mode"] = "create_or_replace"
+
         if not confirm_apply:
-            preview = plan.copy()
-            preview["write_mode"] = "create_or_replace"
-            print(f"[DRY RUN] reconstruct(): {len(preview)} stg_tbl group(s) would be rebuilt. "
+            print(f"[DRY RUN] reconstruct(): {len(plan)} stg_tbl group(s) would be rebuilt. "
                   f"Set confirm_apply=True to execute.")
-            return self._preview(preview)
+            return self._preview(plan)
 
         run_id = self._new_run_id()
-        results: List[Dict[str, Any]] = []
-        for row in plan.itertuples(index=False):
-            print(f"[{run_id}] RECONSTRUCT {row.stg_view} -> {row.stg_tbl} (create_or_replace)...")
-            res = self._execute_group(row.stg_tbl, row.indicator_src_query, "create_or_replace", row.afs_uid_list)
-            res["stg_view"] = row.stg_view
-            res["stg_tbl"] = row.stg_tbl
-            res["afs_uid_list"] = row.afs_uid_list
-            results.append(res)
-            status = res["job_status"]
-            print(f"  -> {status}" + (f": {res['error_message']}" if status == "FAILED" else ""))
+        results = self._execute_plan(plan, run_id, "RECONSTRUCT", max_concurrency)
 
         self._write_log(run_id, "RECONSTRUCT", results)
 
