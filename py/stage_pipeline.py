@@ -59,7 +59,7 @@ trace any row back to the run that touched it.
 All checks happen once, in `validate()`, which runs automatically when
 the class is instantiated: every cfg row except INACTIVE / DELETED is
 loaded and checked together (valid status, non-blank afs_uid /
-afs_source_code, unique afs_uid, existing src_*_vw). Invalid rows are
+afs_source_code / filter_string, unique afs_uid, existing src_*_vw). Invalid rows are
 printed and skipped; `update()` / `reconstruct()` only run the rows that
 passed and never re-validate. Call `validate()` again (or create a new
 instance) after re-syncing the config.
@@ -295,8 +295,9 @@ class StagePipeline:
         A NULL status is loaded too, so _drop_invalid_rows can report it
         instead of it disappearing silently. filter_string is expected to
         already be a valid SQL WHERE-clause fragment (e.g.
-        "col = 'a' AND other > 5"), or blank/NULL for "no filter", so it's
-        used as-is when building the WHERE clause — no parsing here.
+        "col = 'a' AND other > 5"), so it's used as-is when building the
+        WHERE clause — no parsing here. Blank/NULL filter_string rows are
+        loaded but then skipped by _drop_invalid_rows.
         """
         query = f"""
         SELECT *
@@ -347,6 +348,10 @@ class StagePipeline:
           what DRAFT -> REVIEW write-back matches on, so a blank one can't
           be traced or promoted (and NaN uids break sorting/grouping).
         - blank afs_source_code: no src_*_vw / stg_*_tbl can be derived.
+        - blank filter_string: with no WHERE clause the sub_indicator
+          would pull every row of its src_*_vw into the stg_tbl (a whole
+          source copied under one afs_uid). A row that really wants every
+          row must say so explicitly, e.g. filter_string = "TRUE".
         - duplicate afs_uid: each afs_uid must be exactly one cfg row
           (one sub_indicator, one filter_string / pre_process), across all
           loaded statuses. Every row of a duplicated afs_uid is skipped,
@@ -361,6 +366,7 @@ class StagePipeline:
         bad_status = ~df_cfg["status"].isin(RUNNABLE_STATUSES)
         no_uid = df_cfg["afs_uid"].map(self._is_blank)
         no_src = df_cfg["afs_source_code"].map(self._is_blank)
+        no_filter = df_cfg["filter_string"].map(self._is_blank)
         dup_uid = df_cfg["afs_uid"].duplicated(keep=False) & ~no_uid
         no_view = ~no_src & ~df_cfg["afs_source_code"].map(
             lambda code: self._stg_view_name(code) in existing_tables
@@ -370,6 +376,7 @@ class StagePipeline:
             (f"status not in ({', '.join(RUNNABLE_STATUSES)})", bad_status),
             ("blank afs_uid", no_uid),
             ("blank afs_source_code", no_src),
+            ("blank filter_string", no_filter),
             ("duplicate afs_uid", dup_uid),
             ("missing src_{afs_source_code}_vw", no_view),
         ]
@@ -380,7 +387,7 @@ class StagePipeline:
                       f"Fix them and re-sync to include them:")
                 print(df_cfg.loc[mask, show_cols].to_string())
 
-        skip = bad_status | no_uid | no_src | dup_uid | no_view
+        skip = bad_status | no_uid | no_src | no_filter | dup_uid | no_view
         return df_cfg.loc[~skip].reset_index(drop=True)
 
     # ------------------------------------------------------------------
@@ -435,8 +442,9 @@ class StagePipeline:
 
         Each cfg row is one complete sub_indicator — afs_uid is unique and
         its src_*_vw exists, both already enforced by _drop_invalid_rows. filter_string
-        holds the full WHERE-clause fragment for that row (blank/NULL
-        means "no filter", i.e. select everything).
+        holds the full WHERE-clause fragment for that row; blank ones are
+        already skipped by _drop_invalid_rows (the blank branch below is
+        only a defensive fallback).
 
         pre_process (optional column): when non-blank, the filtered
         SELECT above becomes a CTE named `input`, and the pre_process
