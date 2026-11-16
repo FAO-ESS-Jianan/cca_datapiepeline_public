@@ -13,11 +13,14 @@ source_pipeline.SourcePipeline 使用。用 defaultdict 提供"未注册的数�
 或者知道 BaseSourceProcessor 的存在——默认值逻辑留在这一侧。
 """
 
+import logging
 import os
+import re
 import zipfile
 from collections import defaultdict
 from typing import Dict, List, Optional, Type
 
+import country_converter as coco
 import polars as pl
 from slugify import slugify
 
@@ -473,6 +476,141 @@ class FishstatProcessedProcessor(FishstatGlobalProductionProcessor):
         return self._left_join_lookup(lf, lf_product, key=self.PRODUCT_KEY, name=self.PRODUCT_FILE)
 
 
+class ScpHatNationalProcessor(BaseSourceProcessor):
+    """SCP-HAT national data（national-data-export.csv）。
+
+    原始文件是宽表：Country/Region | Indicator | Unit | 1990 | 1991 | ...
+    1. 用正则识别 4 位数字的年份列，unpivot 成 year / value 长表，
+       以后新增年份不需要改代码；value 为空的行直接丢弃。
+    2. 用 country_converter 把 Country/Region 名称转成 M49 码，存进 ref_m49_code（3 位补零）。
+       - 先查 REGION_M49 里的 M49 标准区域名（精确匹配，不区分大小写），
+         因为 coco 的正则会把 "Southern Africa" 误认成 South Africa。
+       - 其余名称交给 coco 转成 ISO3，再用 coco 自带对照表查 UNcode。
+         不直接 to="UNcode"：Kosovo / Taiwan 这类没有 M49 码的名字会让 coco 报错。
+       - 匹配不上的保持 NULL，并打印出来，方便补进 REGION_M49。
+    """
+
+    TARGET_FILENAME = "national-data-export.csv"
+
+    AREA_COL = "Country/Region"
+    YEAR_COL = "year"
+    VALUE_COL = "value"
+    M49_COL = "ref_m49_code"
+
+    YEAR_PATTERN = re.compile(r"^\d{4}$")
+
+    # M49 标准区域：名称 -> 代码。匹配时去首尾空格、不区分大小写。
+    # 注："Micronesia" 既是 M49 区域（057）也是国家（583），国家级数据里大概率指国家，故不放这里。
+    # 数据里如果出现其它区域名（或非 M49 的自定义区域想手动指定代码），在这里追加即可。
+    REGION_M49: Dict[str, str] = {
+        "World": "001",
+        "Africa": "002",
+        "Northern Africa": "015",
+        "Sub-Saharan Africa": "202",
+        "Eastern Africa": "014",
+        "Middle Africa": "017",
+        "Southern Africa": "018",
+        "Western Africa": "011",
+        "Americas": "019",
+        "Latin America and the Caribbean": "419",
+        "Caribbean": "029",
+        "Central America": "013",
+        "South America": "005",
+        "Northern America": "021",
+        "Asia": "142",
+        "Central Asia": "143",
+        "Eastern Asia": "030",
+        "South-eastern Asia": "035",
+        "Southern Asia": "034",
+        "Western Asia": "145",
+        "Europe": "150",
+        "Eastern Europe": "151",
+        "Northern Europe": "154",
+        "Southern Europe": "039",
+        "Western Europe": "155",
+        "Oceania": "009",
+        "Australia and New Zealand": "053",
+        "Melanesia": "054",
+        "Polynesia": "061",
+    }
+
+    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
+        csv_path = self._find_target_csv(input_path)
+        lf = pl.scan_csv(csv_path, infer_schema=False)
+        cols = lf.collect_schema().names()
+
+        if self.AREA_COL not in cols:
+            raise KeyError(f"{os.path.basename(csv_path)} 中未找到列 '{self.AREA_COL}'，现有列: {cols}")
+
+        year_cols = [c for c in cols if self.YEAR_PATTERN.fullmatch(c.strip())]
+        if not year_cols:
+            raise ValueError(f"{os.path.basename(csv_path)} 中未识别到年份列（4 位数字），现有列: {cols}")
+        id_cols = [c for c in cols if c not in year_cols]
+        print(f"📅 识别到 {len(year_cols)} 个年份列: {year_cols[0]} ~ {year_cols[-1]}，标识列: {id_cols}")
+
+        # 名称 -> M49 对照表（只对去重后的名称做一次转换）
+        names = lf.select(pl.col(self.AREA_COL).unique()).collect()[self.AREA_COL].to_list()
+        df_m49 = self._build_m49_mapping(names)
+
+        lf_long = (
+            lf.unpivot(index=id_cols, on=year_cols, variable_name=self.YEAR_COL, value_name=self.VALUE_COL)
+            .with_columns(pl.col(self.YEAR_COL).str.strip_chars())
+            .filter(pl.col(self.VALUE_COL).str.strip_chars().fill_null("") != "")
+        )
+        return lf_long.join(df_m49.lazy(), on=self.AREA_COL, how="left")
+
+    # ------------------------------------------------------------------
+    def _find_target_csv(self, input_path: str) -> str:
+        """非 zip 时 input_path 就是 csv 本身；万一以后变成 zip，按文件名在解压目录里找。"""
+        if not os.path.isdir(input_path):
+            return input_path
+        path = os.path.join(input_path, self.TARGET_FILENAME)
+        if os.path.exists(path):
+            return path
+        return super()._find_target_csv(input_path)
+
+    def _build_m49_mapping(self, names: List[Optional[str]]) -> pl.DataFrame:
+        """返回两列 DataFrame：AREA_COL（原始名称）, M49_COL（3 位字符串或 NULL）。"""
+        region_lookup = {k.strip().casefold(): v for k, v in self.REGION_M49.items()}
+        mapping: Dict[str, Optional[str]] = {}
+        to_coco: List[str] = []
+
+        for name in names:
+            if name is None or not name.strip():
+                continue
+            code = region_lookup.get(name.strip().casefold())
+            if code:
+                mapping[name] = code
+            else:
+                to_coco.append(name)
+
+        if to_coco:
+            # coco 匹配不上时会刷大量 warning，这里只保留错误；未匹配的名称下面统一打印
+            logging.getLogger("country_converter").setLevel(logging.ERROR)
+            cc = coco.CountryConverter()
+
+            un = cc.data[["ISO3", "UNcode"]].dropna()
+            iso3_to_m49 = {iso3: f"{int(u):03d}" for iso3, u in zip(un["ISO3"], un["UNcode"])}
+
+            iso3_list = cc.convert(names=[n.strip() for n in to_coco], src="regex", to="ISO3", not_found=None)
+            if not isinstance(iso3_list, list) or len(to_coco) == 1:
+                iso3_list = [iso3_list]
+
+            for name, iso3 in zip(to_coco, iso3_list):
+                # not_found=None 时 coco 原样返回输入；多重匹配时返回 list，都视为匹配失败
+                mapping[name] = iso3_to_m49.get(iso3) if isinstance(iso3, str) else None
+
+        unmatched = sorted(n for n, c in mapping.items() if c is None)
+        print(f"🌍 M49 匹配: {len(mapping) - len(unmatched)}/{len(mapping)} 个名称成功")
+        if unmatched:
+            print(f"⚠️ 以下名称未匹配到 M49，ref_m49_code 为 NULL（如需要可补进 REGION_M49）: {unmatched}")
+
+        return pl.DataFrame(
+            {self.AREA_COL: list(mapping.keys()), self.M49_COL: list(mapping.values())},
+            schema={self.AREA_COL: pl.Utf8, self.M49_COL: pl.Utf8},
+        )
+
+
 # ----------------------------------------------------------------------
 # 注册表：afs_source_code -> processor 类（不是实例）
 #
@@ -489,5 +627,6 @@ AFS_SOURCE_PROCESSORS: Dict[str, Type[BaseSourceProcessor]] = defaultdict(
         "agincentives": AgIncentivesProcessor,
         "fao_fishstat_globalproduction": FishstatGlobalProductionProcessor,
         "fao_fishstat_processed": FishstatProcessedProcessor,
+        "scp_hat_national": ScpHatNationalProcessor,
     },
 )
