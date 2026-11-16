@@ -330,24 +330,6 @@ class AgIncentivesProcessor(BaseSourceProcessor):
         return pl.scan_csv(matches[0], infer_schema=False)
 
 
-class CustomProcessor(BaseSourceProcessor):
-    """目录下有多个 csv，需要纵向拼接。
-
-    注：目前会把解压目录下所有 .csv 都拼在一起，实际运行中若目录内还包含
-    AreaCodes / ItemCodes 等辅助表，会因为 schema 不一致而报错（历史遗留问题，
-    这次重构未改动，后续排查时留意。）
-    """
-
-    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
-        csv_paths = [
-            os.path.join(input_path, f)
-            for f in os.listdir(input_path)
-            if f.endswith(".csv")
-        ]
-        lazy_frames = [pl.scan_csv(p, ignore_errors=True) for p in csv_paths]
-        return pl.concat(lazy_frames, how="vertical")
-
-
 class FishstatGlobalProductionProcessor(BaseSourceProcessor):
     """FAO FishStat Global Production。
 
@@ -455,6 +437,42 @@ class FishstatGlobalProductionProcessor(BaseSourceProcessor):
         return lf_main.join(lf_lookup.select(keep_cols), on=key, how="left")
 
 
+class FishstatProcessedProcessor(FishstatGlobalProductionProcessor):
+    """FAO FishStat Aquatic Processed Production。
+
+    zip 解压后文件直接在目录下，只用其中两个：
+      - AQUATIC_PROCESSED_PRODUCTION_raw_data (without aggregates).csv   主表
+      - AQUATIC_PROCESSED_PRODUCTION_PRODUCT_ATTRIBUTES.csv              按 PRODUCT 关联
+
+    文件检查、属性表去重、left join 等工具方法直接复用 FishstatGlobalProductionProcessor。
+    """
+
+    MAIN_FILE = "AQUATIC_PROCESSED_PRODUCTION_raw_data (without aggregates).csv"
+    PRODUCT_FILE = "AQUATIC_PROCESSED_PRODUCTION_PRODUCT_ATTRIBUTES.csv"
+
+    PRODUCT_KEY = "PRODUCT"
+
+    # 属性表里需要改名的列：{旧名: 新名}。
+    # 如果属性表里同时有 "PRODUCT"（key）和 "Product"（名称），slugify 后会撞名成
+    # product / product_1，可以在这里改成 {"Product": "product_name"}。
+    PRODUCT_RENAME: Dict[str, str] = {}
+
+    # 属性表里需要去掉的列
+    PRODUCT_DROP: List[str] = []
+
+    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
+        lf = pl.scan_csv(self._file(input_path, self.MAIN_FILE), infer_schema=False)
+        self._require_column(lf.collect_schema().names(), self.PRODUCT_KEY, self.MAIN_FILE)
+
+        lf_product = self._load_lookup(
+            self._file(input_path, self.PRODUCT_FILE),
+            key=self.PRODUCT_KEY,
+            rename=self.PRODUCT_RENAME or None,
+            drop=self.PRODUCT_DROP or None,
+        )
+        return self._left_join_lookup(lf, lf_product, key=self.PRODUCT_KEY, name=self.PRODUCT_FILE)
+
+
 # ----------------------------------------------------------------------
 # 注册表：afs_source_code -> processor 类（不是实例）
 #
@@ -470,5 +488,6 @@ AFS_SOURCE_PROCESSORS: Dict[str, Type[BaseSourceProcessor]] = defaultdict(
         "wb_wdi": WbWdiProcessor,
         "agincentives": AgIncentivesProcessor,
         "fao_fishstat_globalproduction": FishstatGlobalProductionProcessor,
+        "fao_fishstat_processed": FishstatProcessedProcessor,
     },
 )
