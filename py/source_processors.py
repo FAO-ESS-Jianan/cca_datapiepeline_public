@@ -54,21 +54,38 @@ class BaseSourceProcessor:
         self.input_path = dest_folder
         return self.input_path
 
-    @staticmethod
-    def _find_normalized_csv(input_path: str) -> str:
-        """在目录里找标准 faostat 命名的 csv；如果 input_path 本身就是文件，直接返回。"""
-        if os.path.isdir(input_path):
-            csv_files = [
-                f for f in os.listdir(input_path) if f.endswith("E_All_Data_(Normalized).csv")
-            ]
-            if not csv_files:
-                raise FileNotFoundError(f"在 {input_path} 中未找到标准 CSV (*E_All_Data_(Normalized).csv)")
+    NORMALIZED_CSV_SUFFIX = "E_All_Data_(Normalized).csv"
+
+    @classmethod
+    def _find_target_csv(cls, input_path: str) -> str:
+        """确定要读取的 csv：
+        - input_path 本身是文件（非 zip）：直接返回；
+        - 解压目录下只有一个 csv：直接用它，不要求标准命名；
+        - 解压目录下有多个 csv：找标准 faostat 命名的 *E_All_Data_(Normalized).csv。
+        """
+        if not os.path.isdir(input_path):
+            return input_path
+
+        csv_files = sorted(f for f in os.listdir(input_path) if f.lower().endswith(".csv"))
+        if not csv_files:
+            raise FileNotFoundError(f"在 {input_path} 中未找到任何 csv 文件")
+        if len(csv_files) == 1:
+            print(f"📄 解压目录下只有一个 csv，直接使用: {csv_files[0]}")
             return os.path.join(input_path, csv_files[0])
-        return input_path
+
+        normalized = [f for f in csv_files if f.endswith(cls.NORMALIZED_CSV_SUFFIX)]
+        if not normalized:
+            raise FileNotFoundError(
+                f"在 {input_path} 中找到多个 csv，但没有标准命名的 *{cls.NORMALIZED_CSV_SUFFIX}: {csv_files}"
+            )
+        if len(normalized) > 1:
+            print(f"⚠️ 找到多个标准命名的 csv，使用第一个: {normalized}")
+        return os.path.join(input_path, normalized[0])
 
     def read_and_transform(self, input_path: str) -> pl.LazyFrame:
-        """默认实现：按 faostat 标准结构读取。特殊数据源在子类里覆盖这个方法。"""
-        target_path = self._find_normalized_csv(input_path)
+        """默认实现：只有一个 csv 直接读；多个 csv 时按 faostat 标准命名挑选。
+        特殊数据源在子类里覆盖这个方法。"""
+        target_path = self._find_target_csv(input_path)
         return pl.scan_csv(target_path, infer_schema=False)
 
     @staticmethod
@@ -278,23 +295,6 @@ class WbWdiProcessor(BaseSourceProcessor):
         )
 
 
-class UnsdSdgProcessor(BaseSourceProcessor):
-    """解压后目录下只有一个 csv 文件，文件名不遵循 FAOSTAT 的
-    *E_All_Data_(Normalized).csv 命名规则，因此需要自己找 csv 再读取。"""
-
-    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
-        csv_files = [f for f in os.listdir(input_path) if f.endswith(".csv")]
-        if not csv_files:
-            raise FileNotFoundError(f"在 {input_path} 中未找到 csv 文件")
-        if len(csv_files) > 1:
-            raise RuntimeError(
-                f"预期只有一个 csv，但在 {input_path} 中找到多个: {csv_files}"
-            )
-
-        target_path = os.path.join(input_path, csv_files[0])
-        return pl.scan_csv(target_path, infer_schema=False)
-
-
 class AgIncentivesProcessor(BaseSourceProcessor):
     """Ag-Incentives 数据源。
 
@@ -468,7 +468,6 @@ AFS_SOURCE_PROCESSORS: Dict[str, Type[BaseSourceProcessor]] = defaultdict(
     lambda: BaseSourceProcessor,
     {
         "wb_wdi": WbWdiProcessor,
-        "unstats_sdg": UnsdSdgProcessor,
         "agincentives": AgIncentivesProcessor,
         "fao_fishstat_globalproduction": FishstatGlobalProductionProcessor,
     },
