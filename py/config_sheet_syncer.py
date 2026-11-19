@@ -1,6 +1,8 @@
-"""config_sheet_syncer
+# -*- coding: utf-8 -*-
+"""config_sheet_syncer.py
 
-Shared class for syncing a Google Sheet <-> BigQuery config table pair.
+ConfigSheetSyncer — shared class for syncing a Google Sheet <-> BigQuery
+config table pair.
 
 Used by multiple Colab notebooks (e.g. the source-config sync notebook
 and the stage-config notebook) — each notebook does its own auth/client
@@ -15,8 +17,14 @@ the constructor arguments that fit its use case. Both follow the same
       "code"; pass a different column (e.g. "afs_source_code",
       "afs_uid") if that's not the right key for a given sheet.
 
+Environment-free: the spreadsheet, worksheet names and both BigQuery
+table ids are passed in by the caller. Table ids are always full ids
+(`project.dataset.table`), like the pipeline modules.
+
 See the class and method docstrings below for full details.
 """
+
+from __future__ import annotations
 
 from datetime import datetime
 from typing import Dict, Optional
@@ -24,6 +32,17 @@ from typing import Dict, Optional
 import gspread
 import pandas as pd
 from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
+
+
+def _full_id(value: str, n_parts: int, label: str) -> str:
+    """Strip backticks/whitespace and check that `value` is a full id:
+    `project.dataset` (n_parts=2) or `project.dataset.table` (n_parts=3)."""
+    value = (value or "").strip().strip("`")
+    if len(value.split(".")) < n_parts:
+        shape = "project.dataset" if n_parts == 2 else "project.dataset.table"
+        raise ValueError(f"{label} must be a full id ({shape}), got {value!r}")
+    return value
 
 
 class ConfigSheetSyncer:
@@ -44,6 +63,19 @@ class ConfigSheetSyncer:
 
     Create multiple instances to manage different configs (source cfg,
     stage cfg, ...) independently.
+
+    Usage:
+        syncer = ConfigSheetSyncer(
+            bq_client=bq_client,
+            cfg_table_id="my-project.my_dataset.cfg_source_tbl",
+            external_cfg_table_id="my-project.my_dataset.cfg_source_gstbl",
+            spreadsheet=gs_workbook,
+            main_sheet_name="1.source_main",
+            log_sheet_name="1.source_log",
+            row_key_column="afs_source_code",
+        )
+        syncer.pull()   # cfg_table -> Sheet
+        syncer.push()   # Sheet -> external table -> cfg_table
     """
 
     # ------------------------------------------------------------------
@@ -51,39 +83,37 @@ class ConfigSheetSyncer:
     # ------------------------------------------------------------------
     def __init__(
         self,
+        bq_client: bigquery.Client,
+        cfg_table_id: str,
+        external_cfg_table_id: str,
+        spreadsheet: gspread.Spreadsheet,
         main_sheet_name: str,
         log_sheet_name: str,
-        spreadsheet: gspread.Spreadsheet,
-        bq_client: bigquery.Client,
-        dataset_id: str,
-        external_cfg_tbl_name: str,
-        cfg_table_name: str,
-        project_id: Optional[str] = None,
         row_key_column: str = "code",
     ):
         """
         Args:
+            bq_client: BigQuery Client.
+            cfg_table_id: full id of the internal cfg table (the frozen
+                snapshot the pipelines read), e.g.
+                "my-project.my_dataset.cfg_source_tbl".
+            external_cfg_table_id: full id of the external table that
+                points at the Sheet, e.g.
+                "my-project.my_dataset.cfg_source_gstbl".
             spreadsheet: a gspread Spreadsheet object (multiple instances
                 can share the same Spreadsheet and just point at different
                 worksheets).
-            bq_client: BigQuery Client.
-            dataset_id: the BQ dataset this config table lives in.
-            external_cfg_tbl_name: external table name, e.g. "cfg_source_gstbl".
-            cfg_table_name: internal cfg table name, e.g. "cfg_source_tbl".
             main_sheet_name: worksheet name this instance edits, e.g. "main".
             log_sheet_name: this instance's dedicated log worksheet name.
-            project_id: BQ project ID. Defaults to bq_client.project.
             row_key_column: the column used as a unique row key when
                 comparing Sheet vs. cfg_table rows in validate(). Defaults
                 to "code"; pass something like "afs_source_code" or
                 "afs_uid" for configs that use a different key.
         """
-        self.sh = spreadsheet
         self.bq_client = bq_client
-        self.project_id = project_id or bq_client.project
-        self.dataset_id = dataset_id
-        self.cfg_table_name = cfg_table_name
-        self.ext_table_name = external_cfg_tbl_name
+        self.cfg_table_id = _full_id(cfg_table_id, 3, "cfg_table_id")
+        self.external_cfg_table_id = _full_id(external_cfg_table_id, 3, "external_cfg_table_id")
+        self.sh = spreadsheet
         self.row_key_column = row_key_column
 
         self.main_sheet_name = main_sheet_name
@@ -101,15 +131,12 @@ class ConfigSheetSyncer:
     # ------------------------------------------------------------------
     # Small internal helpers
     # ------------------------------------------------------------------
-    @property
-    def cfg_table_ref(self) -> str:
-        """Fully-qualified cfg_table reference, e.g. project.dataset.table"""
-        return f"{self.project_id}.{self.dataset_id}.{self.cfg_table_name}"
-
-    @property
-    def ext_table_ref(self) -> str:
-        """Fully-qualified external table reference, e.g. project.dataset.table_ext"""
-        return f"{self.project_id}.{self.dataset_id}.{self.ext_table_name}"
+    def _table_exists(self, table_id: str) -> bool:
+        try:
+            self.bq_client.get_table(table_id)
+            return True
+        except NotFound:
+            return False
 
     def _init_or_get_log_worksheet(self) -> gspread.Worksheet:
         """[Internal] Get the log worksheet, creating it with headers if missing.
@@ -142,7 +169,7 @@ class ConfigSheetSyncer:
             execution_time,
             direction,
             self.main_sheet_name,
-            self.cfg_table_name,
+            self.cfg_table_id,
             status,
             detail,
         ]
@@ -177,7 +204,7 @@ class ConfigSheetSyncer:
 
     def get_cfg_dataframe_from_bq(self) -> pd.DataFrame:
         """Query the full cfg_table (BQ) into a DataFrame, with no processing."""
-        return self.bq_client.query(f"SELECT * FROM `{self.cfg_table_ref}`").result().to_dataframe()
+        return self.bq_client.query(f"SELECT * FROM `{self.cfg_table_id}`").result().to_dataframe()
 
     # ------------------------------------------------------------------
     # Validation
@@ -336,7 +363,7 @@ class ConfigSheetSyncer:
             bq_df = result["bq_df"]
 
         print(
-            f"[Pull] Syncing {self.cfg_table_name} -> '{self.main_sheet_name}' ..."
+            f"[Pull] Syncing {self.cfg_table_id} -> '{self.main_sheet_name}' ..."
             + (" (force=True, validation skipped)" if force else "")
         )
         try:
@@ -359,7 +386,7 @@ class ConfigSheetSyncer:
     # ------------------------------------------------------------------
     # External table: Sheet -> BQ external table (schema pointer only)
     # ------------------------------------------------------------------
-    def create_external_table(self, ext_table_id: Optional[str] = None):
+    def create_external_table(self, external_cfg_table_id: Optional[str] = None):
         """Create/replace the BQ external table (GOOGLE_SHEETS source)
         pointing at this worksheet.
 
@@ -374,13 +401,13 @@ class ConfigSheetSyncer:
         so every column (even an entirely empty one) is preserved.
 
         Args:
-            ext_table_id: temporarily overrides the external table name
-                (defaults to external_cfg_tbl_name / self.ext_table_name
-                from the constructor). If passed, also updates
-                self.ext_table_name, so subsequent push() calls use it too.
+            external_cfg_table_id: overrides the external table's full id
+                (defaults to the one given to the constructor). If passed,
+                also updates self.external_cfg_table_id, so subsequent
+                push() calls use it too.
         """
-        if ext_table_id:
-            self.ext_table_name = ext_table_id
+        if external_cfg_table_id:
+            self.external_cfg_table_id = _full_id(external_cfg_table_id, 3, "external_cfg_table_id")
 
         sheet_url = self.sh.url
 
@@ -409,10 +436,10 @@ class ConfigSheetSyncer:
         external_config.options.range = self.main_sheet_name
         external_config.autodetect = False
 
-        table = bigquery.Table(self.ext_table_ref, schema=schema)
+        table = bigquery.Table(self.external_cfg_table_id, schema=schema)
         table.external_data_configuration = external_config
 
-        self.bq_client.delete_table(self.ext_table_ref, not_found_ok=True)
+        self.bq_client.delete_table(self.external_cfg_table_id, not_found_ok=True)
         created = self.bq_client.create_table(table)
         print(f"External table ready: {created.full_table_id} -> {sheet_url} ({self.main_sheet_name})")
         print(f"   Schema ({len(schema)} columns, all STRING): {[f.name for f in schema]}")
@@ -454,19 +481,19 @@ class ConfigSheetSyncer:
                 raise ValueError(f"push() validation failed: {result['hard_issues']}")
 
         print(
-            f"[Push] Syncing '{self.main_sheet_name}' -> {self.cfg_table_name} ..."
+            f"[Push] Syncing '{self.main_sheet_name}' -> {self.cfg_table_id} ..."
             + (" (force=True, validation skipped)" if force else "")
         )
         try:
             query = f"""
-                CREATE OR REPLACE TABLE `{self.cfg_table_ref}` AS
-                SELECT * FROM `{self.ext_table_ref}`
+                CREATE OR REPLACE TABLE `{self.cfg_table_id}` AS
+                SELECT * FROM `{self.external_cfg_table_id}`
             """
             job = self.bq_client.query(query)
             job.result()  # wait for completion
 
-            row_count = self.bq_client.get_table(self.cfg_table_ref).num_rows
-            print(f"[Push] Done. '{self.cfg_table_name}' now matches the external table ({row_count} rows)")
+            row_count = self.bq_client.get_table(self.cfg_table_id).num_rows
+            print(f"[Push] Done. '{self.cfg_table_id}' now matches the external table ({row_count} rows)")
             self._log_sync("push", "SUCCESS", detail=f"{row_count} rows" + (" (forced)" if force else ""))
 
         except Exception as e:
@@ -480,14 +507,10 @@ class ConfigSheetSyncer:
     def check_tables_exist(self) -> Dict[str, bool]:
         """Read-only sanity check: do the external and internal cfg
         tables exist yet?"""
-        dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
-        table_names = [tbl.table_id for tbl in self.bq_client.list_tables(dataset_ref)]
-
         result = {
-            self.ext_table_name: self.ext_table_name in table_names,
-            self.cfg_table_name: self.cfg_table_name in table_names,
+            table_id: self._table_exists(table_id)
+            for table_id in (self.external_cfg_table_id, self.cfg_table_id)
         }
-        for name, exists in result.items():
-            status = "exists" if exists else "does NOT exist"
-            print(f"Table '{name}' {status} in dataset '{self.dataset_id}'.")
+        for table_id, exists in result.items():
+            print(f"Table '{table_id}' {'exists' if exists else 'does NOT exist'}.")
         return result

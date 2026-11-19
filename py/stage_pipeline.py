@@ -2,16 +2,20 @@
 """stage_pipeline.py
 
 StagePipeline — the BigQuery-only workflow that builds/refreshes
-staging tables (`stg_*`) from the indicator configuration table
-(`cfg_indicator_tbl`).
+staging tables (`stg_*`) from the stage configuration table
+(`cfg_stage_tbl`).
 
 This module only reads/writes BigQuery. It has no knowledge of the
-Google Sheet side of the config lifecycle (`cfg_indicator_gstbl`,
+Google Sheet side of the config lifecycle (`cfg_stage_gstbl`,
 `ConfigSheetSyncer`) — that sync is handled entirely by
-`sync_stage_configuration` / `sync_source_config` and the shared
-`ConfigSheetSyncer` class. This class only *consumes* `cfg_indicator_tbl`
-once it has already been synced; it never creates or modifies that
-table's structure.
+`ConfigSheetSyncer`. This class only *consumes* `cfg_stage_tbl` once it
+has already been synced; it never creates or modifies that table's
+structure.
+
+Environment-free: the dataset and the config / log table ids are passed
+in by the caller. Table ids are always full ids (`project.dataset.table`),
+dataset ids are `project.dataset`. `src_{afs_source_code}_vw` is read from
+and `stg_{afs_source_code}_tbl` is written to `dataset_id`.
 
 Status lifecycle reminder (for context — only the DRAFT -> REVIEW step
 below is actually performed by this class):
@@ -29,8 +33,9 @@ Two entry points, matching two distinct operational flows:
                      On success, promotes the affected DRAFT rows to
                      REVIEW.
 
-- `reconstruct()` — status ACTIVE / REVIEW / DRAFT. Rebuilds one or all
-                     `stg_tbl` from scratch (CREATE OR REPLACE) when an
+- `reconstruct()` — status ACTIVE / REVIEW / DRAFT. Rebuilds the
+                     `stg_tbl` of the given sources (or all of them)
+                     from scratch (CREATE OR REPLACE) when an
                      upstream data source has changed. INACTIVE rows are
                      not included, so their data drops out of the rebuilt
                      table. On success, promotes the affected DRAFT rows
@@ -74,11 +79,11 @@ from __future__ import annotations
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import pandas as pd
 from google.cloud import bigquery
-from google.api_core.exceptions import GoogleAPIError
+from google.api_core.exceptions import GoogleAPIError, NotFound
 
 
 WriteMode = Literal["delete_insert", "create", "create_or_replace"]
@@ -96,7 +101,7 @@ IGNORED_STATUSES = ["INACTIVE", "DELETED"]
 RUNNABLE_STATUSES = ["DRAFT", "REVIEW", "ACTIVE"]
 
 # Optional cfg column (not in REQUIRED_CFG_COLUMNS — the cfg table's
-# structure is owned by sync_stage_configuration.py, and a missing column
+# structure is owned by ConfigSheetSyncer, and a missing column
 # just means "no pre_process anywhere"). When non-blank it holds a full,
 # standalone SQL query that reads from a table called `input` (the
 # filter_string-filtered rows of the source view, with afs_uid prepended).
@@ -119,34 +124,58 @@ DEFAULT_MAX_CONCURRENCY = 10
 POLL_INTERVAL_SECONDS = 2
 
 
+def _full_id(value: str, n_parts: int, label: str) -> str:
+    """Strip backticks/whitespace and check that `value` is a full id:
+    `project.dataset` (n_parts=2) or `project.dataset.table` (n_parts=3)."""
+    value = (value or "").strip().strip("`")
+    if len(value.split(".")) < n_parts:
+        shape = "project.dataset" if n_parts == 2 else "project.dataset.table"
+        raise ValueError(f"{label} must be a full id ({shape}), got {value!r}")
+    return value
+
+
 class StagePipeline:
     """The BigQuery-only pipeline that builds and refreshes stg_* tables
-    from cfg_indicator_tbl.
+    from cfg_stage_tbl.
 
-    All reads/writes are scoped to `{project_id}.{dataset_id}`. This
-    class only talks to BigQuery — no Sheets access, no knowledge of
-    cfg_indicator_gstbl. It owns and can create its own log table, but
-    it never creates or alters cfg_indicator_tbl — that table is owned
-    by sync_stage_configuration.py.
+    This class only talks to BigQuery — no Sheets access, no knowledge of
+    cfg_stage_gstbl. It owns and can create its own log table, but it
+    never creates or alters cfg_stage_tbl — that table is owned by
+    ConfigSheetSyncer.
 
-    Instantiating the class runs validate() once: cfg_indicator_tbl is
-    read and checked up front, and only the rows that pass are kept for
+    Instantiating the class runs validate() once: cfg_stage_tbl is read
+    and checked up front, and only the rows that pass are kept for
     update() / reconstruct().
+
+    Usage:
+        pipeline = StagePipeline(
+            bq_client=bq_client,
+            dataset_id="my-project.my_dataset",
+            cfg_table_id="my-project.my_dataset.cfg_stage_tbl",
+            log_table_id="my-project.my_dataset.log_stage_tbl",
+        )
+        pipeline.reconstruct(["faostat_qcl", "wb_wdi"])           # preview
+        pipeline.reconstruct(None, confirm_apply=True)            # rebuild all
     """
 
     def __init__(
         self,
         bq_client: bigquery.Client,
-        project_id: str,
         dataset_id: str,
-        config_table_name: str,
-        log_table_name: str,
+        cfg_table_id: str,
+        log_table_id: str,
     ):
+        """
+        dataset_id: full dataset id (`project.dataset`) the src_*_vw views
+            are read from and the stg_*_tbl tables are written to.
+        cfg_table_id: full table id of the stage config table (must exist).
+        log_table_id: full table id of this pipeline's log table (created
+            by validate() if it doesn't exist).
+        """
         self.bq_client = bq_client
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.config_table_name = config_table_name
-        self.log_table_name = log_table_name
+        self.dataset_id = _full_id(dataset_id, 2, "dataset_id")
+        self.cfg_table_id = _full_id(cfg_table_id, 3, "cfg_table_id")
+        self.log_table_id = _full_id(log_table_id, 3, "log_table_id")
         self._view_columns_cache: Dict[str, List[str]] = {}
         self._cfg: pd.DataFrame = pd.DataFrame()
         self.validate()
@@ -155,16 +184,16 @@ class StagePipeline:
     # Small helpers
     # ------------------------------------------------------------------
 
-    @property
-    def _config_table_fqn(self) -> str:
-        return f"{self.project_id}.{self.dataset_id}.{self.config_table_name}"
-
-    @property
-    def _log_table_fqn(self) -> str:
-        return f"{self.project_id}.{self.dataset_id}.{self.log_table_name}"
-
     def _table_fqn(self, table_name: str) -> str:
-        return f"{self.project_id}.{self.dataset_id}.{table_name}"
+        """Full id of a table / view in dataset_id."""
+        return f"{self.dataset_id}.{table_name}"
+
+    def _table_exists(self, table_id: str) -> bool:
+        try:
+            self.bq_client.get_table(table_id)
+            return True
+        except NotFound:
+            return False
 
     @staticmethod
     def _new_run_id() -> str:
@@ -191,8 +220,8 @@ class StagePipeline:
         return msg
 
     def _existing_tables(self) -> set:
-        dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
-        return {t.table_id for t in self.bq_client.list_tables(dataset_ref)}
+        """Short names of every table / view in dataset_id."""
+        return {t.table_id for t in self.bq_client.list_tables(self.dataset_id)}
 
     def _view_columns(self, view_name: str) -> List[str]:
         """Column names of a src_*_vw view, in schema order. Cached per
@@ -235,24 +264,20 @@ class StagePipeline:
         ]
 
     def _create_log_table(self) -> None:
-        table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            self.log_table_name,
-        )
-        table = bigquery.Table(table_ref, schema=self._log_table_schema())
+        table = bigquery.Table(self.log_table_id, schema=self._log_table_schema())
         self.bq_client.create_table(table)
-        print(f"Created log table `{self._log_table_fqn}`.")
+        print(f"Created log table `{self.log_table_id}`.")
 
     def validate(self) -> None:
         """All pre-flight checks, in one place. __init__ calls this
-        automatically; call it again yourself only after cfg_indicator_tbl
+        automatically; call it again yourself only after cfg_stage_tbl
         has been re-synced (e.g. after editing the config Sheet), to
         reload and re-check it. update() / reconstruct() never call it.
 
-        1. cfg_indicator_tbl must exist. This class never creates it —
-           that table is owned by sync_stage_configuration.py, and a
-           missing cfg table means something upstream hasn't run yet, so
-           this raises rather than silently continuing.
+        1. cfg_stage_tbl must exist. This class never creates it — that
+           table is owned by ConfigSheetSyncer, and a missing cfg table
+           means something upstream hasn't run yet, so this raises rather
+           than silently continuing.
         2. The log table is created with the schema above if it doesn't
            exist yet.
         3. All cfg rows except INACTIVE / DELETED are loaded and checked
@@ -260,22 +285,20 @@ class StagePipeline:
            DRAFT, REVIEW and ACTIVE at once. Invalid rows are printed and
            skipped; the rest are cached, and every cached row is runnable.
         """
-        existing = self._existing_tables()
-
-        if self.config_table_name not in existing:
+        if not self._table_exists(self.cfg_table_id):
             raise RuntimeError(
-                f"Config table '{self.config_table_name}' not found in "
-                f"{self.project_id}.{self.dataset_id}. This table is expected to "
-                f"already exist (owned by sync_stage_configuration.py) — "
-                f"StagePipeline does not create it."
+                f"Config table '{self.cfg_table_id}' not found. This table is expected to "
+                f"already exist (owned by ConfigSheetSyncer) — StagePipeline does not create it."
             )
-        print(f"Config table '{self.config_table_name}' found.")
+        print(f"Config table '{self.cfg_table_id}' found.")
 
-        if self.log_table_name not in existing:
-            print(f"Log table '{self.log_table_name}' not found — creating it.")
+        if not self._table_exists(self.log_table_id):
+            print(f"Log table '{self.log_table_id}' not found — creating it.")
             self._create_log_table()
         else:
-            print(f"Log table '{self.log_table_name}' found.")
+            print(f"Log table '{self.log_table_id}' found.")
+
+        existing = self._existing_tables()
 
         df_cfg = self._load_cfg()
         n_loaded = len(df_cfg)
@@ -287,11 +310,11 @@ class StagePipeline:
               f"{n_loaded - len(self._cfg)} skipped.")
 
     # ------------------------------------------------------------------
-    # Step 1 — load cfg_indicator_tbl (called by validate() only)
+    # Step 1 — load cfg_stage_tbl (called by validate() only)
     # ------------------------------------------------------------------
 
     def _load_cfg(self) -> pd.DataFrame:
-        """Read every cfg_indicator_tbl row except INACTIVE / DELETED.
+        """Read every cfg_stage_tbl row except INACTIVE / DELETED.
         A NULL status is loaded too, so _drop_invalid_rows can report it
         instead of it disappearing silently. filter_string is expected to
         already be a valid SQL WHERE-clause fragment (e.g.
@@ -301,7 +324,7 @@ class StagePipeline:
         """
         query = f"""
         SELECT *
-        FROM `{self._config_table_fqn}`
+        FROM `{self.cfg_table_id}`
         WHERE status IS NULL OR status NOT IN UNNEST(@ignored_statuses)
         """
         job_config = bigquery.QueryJobConfig(query_parameters=[
@@ -311,18 +334,28 @@ class StagePipeline:
 
         missing = REQUIRED_CFG_COLUMNS - set(df_cfg.columns)
         if missing:
-            raise ValueError(f"cfg_indicator_tbl is missing required columns: {missing}")
+            raise ValueError(f"{self.cfg_table_id} is missing required columns: {missing}")
 
         return df_cfg
 
-    def _runnable_cfg(self, statuses: List[str], afs_source_code: Optional[str] = None) -> pd.DataFrame:
+    @staticmethod
+    def _normalize_codes(afs_source_codes: Union[None, str, Iterable[str]]) -> Optional[List[str]]:
+        """None -> None (every source); a single code or a list -> a
+        de-duplicated list, in order."""
+        if afs_source_codes is None:
+            return None
+        if isinstance(afs_source_codes, str):
+            return [afs_source_codes]
+        return list(dict.fromkeys(afs_source_codes))
+
+    def _runnable_cfg(self, statuses: List[str], afs_source_codes: Optional[List[str]] = None) -> pd.DataFrame:
         """Slice of the rows validate() cached, by status (and optionally
-        a single afs_source_code). No BigQuery read, no re-validation."""
+        by afs_source_code). No BigQuery read, no re-validation."""
         if self._cfg.empty:
             return self._cfg
         mask = self._cfg["status"].isin(statuses)
-        if afs_source_code:
-            mask &= self._cfg["afs_source_code"] == afs_source_code
+        if afs_source_codes is not None:
+            mask &= self._cfg["afs_source_code"].isin(afs_source_codes)
         return self._cfg.loc[mask].reset_index(drop=True)
 
     @staticmethod
@@ -753,12 +786,12 @@ END;"""
             for r in results
         ]
 
-        errors = self.bq_client.insert_rows_json(self._log_table_fqn, rows)
+        errors = self.bq_client.insert_rows_json(self.log_table_id, rows)
         if errors:
             # A logging failure shouldn't take down the pipeline run
             # itself (the stg_tbl writes already happened), but it must
             # not fail silently either.
-            print(f"WARNING: failed to write {len(errors)} row(s) to {self.log_table_name}: {errors}")
+            print(f"WARNING: failed to write {len(errors)} row(s) to {self.log_table_id}: {errors}")
 
     # ------------------------------------------------------------------
     # Step 5 — status write-back (UPDATE and RECONSTRUCT flows)
@@ -770,7 +803,7 @@ END;"""
         left as DRAFT and retried the next time update() / reconstruct()
         runs.
 
-        The validated cfg cache is updated first, then cfg_indicator_tbl
+        The validated cfg cache is updated first, then cfg_stage_tbl
         only for the uids that were actually DRAFT in the cache (ACTIVE /
         REVIEW uids in the list are ignored, and no UPDATE runs if none
         were DRAFT).
@@ -790,7 +823,7 @@ END;"""
         self._cfg.loc[promoted, "status"] = "REVIEW"
 
         sql = f"""
-        UPDATE `{self._config_table_fqn}`
+        UPDATE `{self.cfg_table_id}`
         SET status = 'REVIEW'
         WHERE status = 'DRAFT' AND afs_uid IN UNNEST(@uids)
         """
@@ -802,7 +835,7 @@ END;"""
             job.result()
         except Exception as exc:  # noqa: BLE001 - data is already written, don't fail the run
             print(f"WARNING: {len(uids)} afs_uid marked REVIEW in the local cfg cache, but the "
-                  f"UPDATE on {self.config_table_name} failed, so they are still DRAFT in "
+                  f"UPDATE on {self.cfg_table_id} failed, so they are still DRAFT in "
                   f"BigQuery (safe to re-run later): {self._format_error(exc)}")
             return 0
         return job.num_dml_affected_rows or 0
@@ -874,7 +907,7 @@ END;"""
 
     def reconstruct(
         self,
-        afs_source_code: Optional[str] = None,
+        afs_source_codes: Union[None, str, Iterable[str]] = None,
         confirm_apply: bool = False,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ) -> pd.DataFrame:
@@ -890,19 +923,26 @@ END;"""
         are promoted to REVIEW. ACTIVE / REVIEW rows keep their status,
         and DRAFT rows in failed groups stay DRAFT.
 
-        afs_source_code=None rebuilds every (stg_view, stg_tbl) group
-        found; pass a specific afs_source_code to rebuild only the
-        stg_tbl it feeds, without affecting any other stg_tbl.
+        afs_source_codes=None rebuilds every (stg_view, stg_tbl) group
+        found; pass one afs_source_code or a list of them to rebuild only
+        the stg_tbl they feed, without affecting any other stg_tbl. All
+        selected groups run as one run (one run_id). A requested code
+        with no validated cfg row is reported and skipped.
 
         Runs on the rows validate() cached at instantiation; nothing is
         re-validated here. Nothing is executed until confirm_apply=True;
         calling this with the default returns a preview of the groups
         that would run.
         """
-        df_cfg = self._runnable_cfg(RUNNABLE_STATUSES, afs_source_code=afs_source_code)
+        codes = self._normalize_codes(afs_source_codes)
+        df_cfg = self._runnable_cfg(RUNNABLE_STATUSES, afs_source_codes=codes)
+        if codes is not None:
+            found = set(df_cfg["afs_source_code"]) if not df_cfg.empty else set()
+            unknown = [c for c in codes if c not in found]
+            if unknown:
+                print(f"WARNING: no validated cfg rows for {len(unknown)} afs_source_code(s), skipped: {unknown}")
         if df_cfg.empty:
-            scope = f" for afs_source_code='{afs_source_code}'" if afs_source_code else ""
-            print(f"No validated cfg rows{scope}. Nothing to reconstruct.")
+            print("No validated cfg rows selected. Nothing to reconstruct.")
             return pd.DataFrame()
 
         plan = self._build_query_plan(df_cfg)
@@ -948,15 +988,14 @@ END;"""
         Based on the cfg cache from the last validate().
         """
         used = set(self._cfg["afs_source_code"].map(self._stg_tbl_name)) if not self._cfg.empty else set()
-        dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
 
         rows = []
-        for item in self.bq_client.list_tables(dataset_ref):
+        for item in self.bq_client.list_tables(self.dataset_id):
             name = item.table_id
             if (item.table_type != "TABLE"
                     or not (name.startswith("stg_") and name.endswith("_tbl"))
                     or name in used
-                    or name in (self.config_table_name, self.log_table_name)):
+                    or self._table_fqn(name) in (self.cfg_table_id, self.log_table_id)):
                 continue
             table = self.bq_client.get_table(self._table_fqn(name))
             rows.append({

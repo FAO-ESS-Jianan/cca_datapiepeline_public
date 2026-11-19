@@ -78,6 +78,12 @@ mixed into anything that reads the folder later. So by default
 subfolder (`{gcs_base_uri}/{table_name}/`) is deleted right before the
 extract job runs. Nothing outside that subfolder is touched.
 
+Environment-free: the dataset, the config / scope / log table ids and
+the GCS export location are passed in by the caller. Table ids are always
+full ids (`project.dataset.table`), dataset ids are `project.dataset`.
+The `src_*_vw` / `stg_*_tbl` inputs are read from, and the union views,
+ref table and output tables are written to, `dataset_id`.
+
 Validation only checks table names: `cfg_stage_tbl` (and, for STG, the
 scope table) must exist; the expected `src_*_vw` / `stg_*_tbl` objects are
 looked up (missing ones are skipped with a warning, none found raises);
@@ -93,11 +99,11 @@ preview of the SQL/plan for review.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from google.cloud import bigquery
-from google.api_core.exceptions import GoogleAPIError
+from google.cloud import bigquery, storage
+from google.api_core.exceptions import GoogleAPIError, NotFound
 
 
 # Which cfg_stage_tbl statuses go into the ref table (build_ref_table)
@@ -122,6 +128,28 @@ STEP_BUILD_STG_TABLE = "BUILD_STG_TABLE"
 STEP_EXPORT_STG_GCS = "EXPORT_STG_GCS"
 
 
+def _full_id(value: str, n_parts: int, label: str) -> str:
+    """Strip backticks/whitespace and check that `value` is a full id:
+    `project.dataset` (n_parts=2) or `project.dataset.table` (n_parts=3)."""
+    value = (value or "").strip().strip("`")
+    if len(value.split(".")) < n_parts:
+        shape = "project.dataset" if n_parts == 2 else "project.dataset.table"
+        raise ValueError(f"{label} must be a full id ({shape}), got {value!r}")
+    return value
+
+
+def _split_gcs_uri(uri: str) -> Tuple[str, str]:
+    """'gs://bucket/some/prefix' -> ('bucket', 'some/prefix/'); the prefix
+    is '' when the URI is just the bucket."""
+    uri = (uri or "").strip().rstrip("/")
+    if not uri.startswith("gs://"):
+        raise ValueError(f"GCS URI must start with gs://, got {uri!r}")
+    bucket, _, path = uri[len("gs://"):].partition("/")
+    if not bucket:
+        raise ValueError(f"GCS URI has no bucket: {uri!r}")
+    return bucket, f"{path}/" if path else ""
+
+
 class ExportPipeline:
     """The BigQuery-only pipeline that builds two independent output
     tables — src (union of src_*_vw) and stg (union of stg_*_tbl,
@@ -129,22 +157,34 @@ class ExportPipeline:
     has its own validate_*() / run_*() entry point (see the module
     docstring).
 
-    All reads/writes are scoped to `{project_id}.{dataset_id}`, except
-    the GCS export itself. This class only reads `cfg_stage_tbl`, the
-    scope table, the `stg_*_tbl` tables and the `src_*_vw` views — it
-    never creates or alters any of them; it owns only the two union
-    views, the ref table, the two output tables, and its own log table.
+    This class only reads `cfg_stage_tbl`, the scope table, the
+    `stg_*_tbl` tables and the `src_*_vw` views — it never creates or
+    alters any of them; it owns only the two union views, the ref table,
+    the two output tables, and its own log table.
+
+    Usage:
+        pipeline = ExportPipeline(
+            bq_client=bq_client,
+            gcs_client=gcs_client,
+            dataset_id="my-project.my_dataset",
+            cfg_table_id="my-project.my_dataset.cfg_stage_tbl",
+            log_table_id="my-project.my_dataset.log_export_tbl",
+            gcs_base_uri="gs://my-bucket/exports",
+            scope_table_id="my-project.my_dataset.dim_ref_scope_m49_tbl",
+        )
+        pipeline.run_src(confirm_apply=True)
+        pipeline.run_stg(confirm_apply=True)
     """
 
     def __init__(
         self,
         bq_client: bigquery.Client,
-        project_id: str,
+        gcs_client: storage.Client,
         dataset_id: str,
-        cfg_stage_table_name: str,
-        scope_table_name: str,
-        log_table_name: str,
+        cfg_table_id: str,
+        log_table_id: str,
         gcs_base_uri: str,
+        scope_table_id: str,
         src_view_name: str = "exp_src_long_vw",
         src_table_name: str = "exp_src_long_tbl",
         stg_view_name: str = "exp_stg_long_vw",
@@ -155,13 +195,25 @@ class ExportPipeline:
         stg_export_compression: Optional[str] = "SNAPPY",
         clear_export_folder: bool = True,
     ):
+        """
+        dataset_id: full dataset id (`project.dataset`) the src_*_vw /
+            stg_*_tbl inputs are read from and the exp_* objects (named by
+            the *_name arguments below) are written to.
+        cfg_table_id: full table id of the stage config table (read only).
+        log_table_id: full table id of this pipeline's log table (created
+            if it doesn't exist).
+        gcs_base_uri: `gs://bucket[/prefix]` directory the exports go
+            under — no wildcard, no filename.
+        scope_table_id: full table id of the m49 scope table (STG only).
+        """
         self.bq_client = bq_client
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.cfg_stage_table_name = cfg_stage_table_name
-        self.scope_table_name = scope_table_name
-        self.log_table_name = log_table_name
-        self.gcs_base_uri = gcs_base_uri
+        self.gcs_client = gcs_client
+        self.dataset_id = _full_id(dataset_id, 2, "dataset_id")
+        self.cfg_table_id = _full_id(cfg_table_id, 3, "cfg_table_id")
+        self.log_table_id = _full_id(log_table_id, 3, "log_table_id")
+        self.scope_table_id = _full_id(scope_table_id, 3, "scope_table_id")
+        _split_gcs_uri(gcs_base_uri)  # validate early
+        self.gcs_base_uri = gcs_base_uri.rstrip("/")
         self.src_view_name = src_view_name
         self.src_table_name = src_table_name
         self.stg_view_name = stg_view_name
@@ -186,19 +238,15 @@ class ExportPipeline:
     # ------------------------------------------------------------------
 
     def _table_fqn(self, table_name: str) -> str:
-        return f"{self.project_id}.{self.dataset_id}.{table_name}"
+        """Full id of a table / view in dataset_id."""
+        return f"{self.dataset_id}.{table_name}"
 
-    @property
-    def _cfg_stage_table_fqn(self) -> str:
-        return self._table_fqn(self.cfg_stage_table_name)
-
-    @property
-    def _scope_table_fqn(self) -> str:
-        return self._table_fqn(self.scope_table_name)
-
-    @property
-    def _log_table_fqn(self) -> str:
-        return self._table_fqn(self.log_table_name)
+    def _table_exists(self, table_id: str) -> bool:
+        try:
+            self.bq_client.get_table(table_id)
+            return True
+        except NotFound:
+            return False
 
     @property
     def _src_view_fqn(self) -> str:
@@ -228,7 +276,7 @@ class ExportPipeline:
         number (`{table_name}_000000000000.{extension}`, ...) — how
         many shards depends on the table's size, not on anything set
         here."""
-        return f"{self.gcs_base_uri.rstrip('/')}/{table_name}/{table_name}_*.{extension}"
+        return f"{self.gcs_base_uri}/{table_name}/{table_name}_*.{extension}"
 
     @property
     def _src_export_uri(self) -> str:
@@ -268,8 +316,8 @@ class ExportPipeline:
         return msg
 
     def _existing_tables(self) -> set:
-        dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
-        return {t.table_id for t in self.bq_client.list_tables(dataset_ref)}
+        """Short names of every table / view in dataset_id."""
+        return {t.table_id for t in self.bq_client.list_tables(self.dataset_id)}
 
     def _distinct_source_codes(self) -> List[str]:
         """Every non-null afs_source_code in cfg_stage_tbl — status is
@@ -279,7 +327,7 @@ class ExportPipeline:
         """
         sql = f"""
         SELECT DISTINCT afs_source_code
-        FROM `{self._cfg_stage_table_fqn}`
+        FROM `{self.cfg_table_id}`
         WHERE afs_source_code IS NOT NULL
         """
         df = self.bq_client.query(sql).to_dataframe()
@@ -307,13 +355,9 @@ class ExportPipeline:
         ]
 
     def _create_log_table(self) -> None:
-        table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            self.log_table_name,
-        )
-        table = bigquery.Table(table_ref, schema=self._log_table_schema())
+        table = bigquery.Table(self.log_table_id, schema=self._log_table_schema())
         self.bq_client.create_table(table)
-        print(f"Created log table `{self._log_table_fqn}`.")
+        print(f"Created log table `{self.log_table_id}`.")
 
     # ------------------------------------------------------------------
     # Validation helpers (table names only) + discovery
@@ -323,21 +367,17 @@ class ExportPipeline:
         """Table-name checks only: cfg_stage_tbl (plus any extra tables
         the calling workflow needs) must exist — this class never
         creates them. The log table is created if it doesn't exist."""
-        existing = self._existing_tables()
-        required = {"Config table": self.cfg_stage_table_name, **extra_required}
-        for label, name in required.items():
-            if name not in existing:
-                raise RuntimeError(
-                    f"{label} '{name}' not found in "
-                    f"{self.project_id}.{self.dataset_id}. ExportPipeline does not create it."
-                )
-            print(f"{label} '{name}' found.")
+        required = {"Config table": self.cfg_table_id, **extra_required}
+        for label, table_id in required.items():
+            if not self._table_exists(table_id):
+                raise RuntimeError(f"{label} '{table_id}' not found. ExportPipeline does not create it.")
+            print(f"{label} '{table_id}' found.")
 
-        if self.log_table_name not in existing:
-            print(f"Log table '{self.log_table_name}' not found — creating it.")
+        if not self._table_exists(self.log_table_id):
+            print(f"Log table '{self.log_table_id}' not found — creating it.")
             self._create_log_table()
         else:
-            print(f"Log table '{self.log_table_name}' found.")
+            print(f"Log table '{self.log_table_id}' found.")
 
     def _discover_existing(self, name_fn, label: str) -> List[str]:
         """All non-null, distinct afs_source_code in cfg_stage_tbl,
@@ -396,32 +436,21 @@ class ExportPipeline:
             result["error_message"] = self._format_error(exc)
         return result
 
-    def _export_folder(self, table_name: str):
+    def _export_folder(self, table_name: str) -> Tuple[str, str]:
         """(bucket_name, prefix) of one table's export subfolder,
         i.e. `{gcs_base_uri}/{table_name}/` split into its parts."""
-        base = self.gcs_base_uri.rstrip("/")
-        if not base.startswith("gs://"):
-            raise ValueError(f"gcs_base_uri must start with gs://, got '{self.gcs_base_uri}'")
-        bucket_name, _, path = base[len("gs://"):].partition("/")
-        prefix = f"{path}/{table_name}/" if path else f"{table_name}/"
-        return bucket_name, prefix
+        bucket_name, prefix = _split_gcs_uri(self.gcs_base_uri)
+        return bucket_name, f"{prefix}{table_name}/"
 
     def _clear_export_folder(self, table_name: str) -> int:
         """Deletes every object under `{gcs_base_uri}/{table_name}/`
         (only that table's own subfolder) and returns how many were
         deleted. Called right before the extract job when
-        clear_export_folder=True. Uses the BigQuery client's
-        credentials, so no extra auth is needed."""
-        from google.cloud import storage  # imported lazily: only needed for exports
-
+        clear_export_folder=True."""
         bucket_name, prefix = self._export_folder(table_name)
-        client = storage.Client(
-            project=self.bq_client.project,
-            credentials=self.bq_client._credentials,
-        )
-        blobs = list(client.list_blobs(bucket_name, prefix=prefix))
+        blobs = list(self.gcs_client.list_blobs(bucket_name, prefix=prefix))
         if blobs:
-            client.bucket(bucket_name).delete_blobs(blobs)
+            self.gcs_client.bucket(bucket_name).delete_blobs(blobs)
         print(f"Cleared {len(blobs)} old object(s) from gs://{bucket_name}/{prefix}")
         return len(blobs)
 
@@ -556,9 +585,9 @@ class ExportPipeline:
             for r in results
         ]
 
-        errors = self.bq_client.insert_rows_json(self._log_table_fqn, rows)
+        errors = self.bq_client.insert_rows_json(self.log_table_id, rows)
         if errors:
-            print(f"WARNING: failed to write {len(errors)} row(s) to {self.log_table_name}: {errors}")
+            print(f"WARNING: failed to write {len(errors)} row(s) to {self.log_table_id}: {errors}")
 
     # ==================================================================
     # SRC WORKFLOW — exp_src_long_vw -> exp_src_long_tbl -> Avro on GCS
@@ -702,7 +731,7 @@ class ExportPipeline:
         exist, the log table exists (created if not), and at least one
         expected stg_*_tbl exists (missing ones are warned about and
         skipped)."""
-        self._check_base_tables({"Scope table": self.scope_table_name})
+        self._check_base_tables({"Scope table": self.scope_table_id})
         tables = self._discover_stg_tables()
         if not tables:
             raise RuntimeError("No stg_*_tbl found for the source codes in cfg_stage_tbl.")
@@ -738,11 +767,11 @@ class ExportPipeline:
           SELECT
             m49_code AS afs_m49_code,
             area_name AS afs_area_name
-          FROM `{self._scope_table_fqn}`
+          FROM `{self.scope_table_id}`
         ),
         indicators AS (
           SELECT DISTINCT afs_uid
-          FROM `{self._cfg_stage_table_fqn}`
+          FROM `{self.cfg_table_id}`
           WHERE status IN ({statuses_literal})
         )
         SELECT
@@ -887,7 +916,7 @@ class ExportPipeline:
             afs_subtheme_code,     afs_subtheme_name,
             afs_indicator_code,    afs_indicator_name,
             afs_subindicator_code, afs_subindicator_name
-          FROM `{self._cfg_stage_table_fqn}`
+          FROM `{self.cfg_table_id}`
           WHERE status IN ({statuses_literal})
         )
         SELECT

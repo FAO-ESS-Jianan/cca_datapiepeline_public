@@ -1,33 +1,46 @@
+# -*- coding: utf-8 -*-
+"""source_pipeline.py
+
+SourcePipeline — the source-stage ETL. For each `afs_source_code` in the
+source config table: download the raw file -> let its processor turn it
+into Parquet -> upload it to GCS -> (re)build the BigQuery external table
+`src_{afs_source_code}_exttbl` on top of it -> log the run -> on success,
+write `afs_source_ingested_at` back to the config table.
+
+Environment-free: every project-specific value (config / log table ids,
+the dataset the external tables are created in, the GCS location, the
+local working folder) is passed in by the caller. Table ids are always
+full ids (`project.dataset.table`), dataset ids are `project.dataset`.
+
+Decoupled from the processors: this module never imports
+`source_processors.py`. Processor classes are looked up in the
+`processor_registry` passed to the constructor (a dict-like keyed by
+`afs_source_code`); what an unregistered code falls back to is up to the
+registry itself (e.g. a `collections.defaultdict`).
+
+One instance serves one "current" source at a time:
+`set_afs_source_code()` is the only way to switch it, and every step
+method reads `self.afs_source_code` instead of taking its own code
+argument. `run_batch()` loops over many codes with that same mechanism.
+
+The config table is read once at construction (and again only on an
+explicit `refresh_cfg()`), so a batch run never re-queries it per source.
+
+Error contract:
+- Config problems (code not in the config table, missing `download_url`)
+  raise from `set_afs_source_code()` and are never logged to the log
+  table. `run_batch()` catches them and reports the code as FAILED.
+- Problems while running (download / transform / upload / table build)
+  are caught by `run()`, recorded as FAILED and logged.
 """
-source_pipeline.py
 
-Source 阶段 ETL 的核心执行器。
-
-负责：整表拉取并缓存 BigQuery 配置表 -> 按 afs_source_code 校验/取出一行配置 ->
-检查 GCS 上是否已有相同版本 -> 下载原始文件 -> 交给 processor 转换成 parquet ->
-上传 GCS -> 建 BigQuery 外部表 -> 写运行日志 -> 成功时回写配置表。
-
-设计要点（与 processor 体系解耦）：
-- 不 import source_processors.py 里的任何类。processor 类通过构造时传入的
-  processor_registry（一个 dict-like 对象，key 是 afs_source_code）按需查找，
-  找不到时的默认值由 registry 自己负责（推荐用 collections.defaultdict），
-  这样本文件完全不需要知道 BaseSourceProcessor 的存在。
-- 一个实例只服务"当前"一个数据源：afs_source_code 通过 set_afs_source_code()
-  统一设置和切换，其余所有方法都读取 self.afs_source_code，不再单独接收 code
-  参数，避免多处传参互相打架。
-- 配置表整表只在构造时（以及显式调用 refresh_cfg() 时）拉取一次并缓存，
-  批量运行多个数据源时不会重复查询。
-- 配置本身的问题（afs_source_code 未设置 / 配置表里找不到 / download_url
-  缺失）一律直接抛出，不在 run() 内部兜底、也不写日志，交给外层调用方处理。
-  只有"配置没问题、流程执行中途出错"（下载/转换/上传失败等）才会被 run()
-  捕获、记为 FAILED 并写入日志。
-"""
+from __future__ import annotations
 
 import os
-import time
 import shutil
+import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -37,152 +50,196 @@ from google.cloud import bigquery, storage
 from google.api_core.exceptions import NotFound
 
 
+# Column of the config table that identifies a source.
+KEY_COLUMN = "afs_source_code"
+
+# Columns of the DataFrame returned by run_batch() (and of each run() result).
+RESULT_COLUMNS = [
+    "execution_time", "afs_source_code", "afs_source_updated_at", "afs_source_ingested_at",
+    "gcs_uri", "bq_table_id", "status", "message",
+]
+
+# Some sites (e.g. agincentives.org) reject requests' default
+# python-requests User-Agent with a 403, so every download sends browser
+# headers. The Referer is set per download from the URL's own domain.
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "Accept": "*/*",
+}
+
+
+def _full_id(value: str, n_parts: int, label: str) -> str:
+    """Strip backticks/whitespace and check that `value` is a full id:
+    `project.dataset` (n_parts=2) or `project.dataset.table` (n_parts=3)."""
+    value = (value or "").strip().strip("`")
+    if len(value.split(".")) < n_parts:
+        shape = "project.dataset" if n_parts == 2 else "project.dataset.table"
+        raise ValueError(f"{label} must be a full id ({shape}), got {value!r}")
+    return value
+
+
+def _split_gcs_uri(uri: str) -> Tuple[str, str]:
+    """'gs://bucket/some/prefix' -> ('bucket', 'some/prefix/'); the prefix
+    is '' when the URI is just the bucket."""
+    uri = (uri or "").strip().rstrip("/")
+    if not uri.startswith("gs://"):
+        raise ValueError(f"GCS URI must start with gs://, got {uri!r}")
+    bucket, _, path = uri[len("gs://"):].partition("/")
+    if not bucket:
+        raise ValueError(f"GCS URI has no bucket: {uri!r}")
+    return bucket, f"{path}/" if path else ""
+
+
 class SourcePipeline:
-    """source 阶段的执行器：下载 -> processor 转换 -> 上传 GCS -> 建外部表 -> 记日志 -> 回写配置表。
+    """Source-stage executor: download -> processor -> GCS -> external
+    table -> log -> config write-back.
 
-    用法：
-        pipeline = SourcePipeline(bq_client, gcs_client, bucket_name, dataset_id,
-                                   cfg_tbl_name, log_tbl_name,
-                                   processor_registry=AFS_SOURCE_PROCESSORS)
+    Usage:
+        pipeline = SourcePipeline(
+            bq_client=bq_client,
+            gcs_client=gcs_client,
+            dataset_id="my-project.my_dataset",
+            cfg_table_id="my-project.my_dataset.cfg_source_tbl",
+            log_table_id="my-project.my_dataset.log_source_tbl",
+            gcs_base_uri="gs://my-bucket",
+            local_dir="/path/to/work_dir",
+            processor_registry=AFS_SOURCE_PROCESSORS,
+        )
 
-        # 一键运行
-        pipeline.set_afs_source_code("faostat_rlis")
-        result = pipeline.run(force=False, cleanup=False)
+        # Batch: None = every source in the config table
+        results = pipeline.run_batch(["faostat_qcl", "wb_wdi"])
 
-        # 分步调试（同一套状态，切换 code 后各步骤都读取当前状态）
-        pipeline.set_afs_source_code("faostat_rlis")
+        # One source, step by step (all steps share the current source)
+        pipeline.set_afs_source_code("faostat_qcl")
         pipeline.download()
         processor = pipeline.build_processor()
         lazy_df = processor.read_and_transform(processor.resolve_input_path())
-        ...
     """
-
-    # 部分站点（如 agincentives.org）会拦截 requests 默认的 python-requests UA，返回 403，
-    # 因此统一伪装成浏览器请求头。Referer 在 download() 里按下载地址的域名动态生成。
-    DEFAULT_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
-        "Accept": "*/*",
-    }
 
     def __init__(
         self,
         bq_client: bigquery.Client,
         gcs_client: storage.Client,
-        bucket_name: str,
         dataset_id: str,
-        cfg_tbl_name: str,
-        log_tbl_name: str,
+        cfg_table_id: str,
+        log_table_id: str,
+        gcs_base_uri: str,
+        local_dir: str,
         processor_registry: Dict[str, Any],
-        afs_source_code: Optional[str] = None,
+        default_agency: str = "faostat",
     ):
         """
-        cfg_tbl_name / log_tbl_name 用完整的 `project.dataset.table` 格式，
-        避免依赖 bq_client 默认的 project/dataset。
-        processor_registry 是一个 code -> processor 类 的映射（dict 或
-        collections.defaultdict），本类只按需查找，不假设任何具体的默认类。
-        afs_source_code 可选：不传的话之后用 set_afs_source_code() 再设置。
+        dataset_id: full dataset id (`project.dataset`) the
+            `src_{afs_source_code}_exttbl` external tables are created in.
+        cfg_table_id / log_table_id: full table ids. The log table is
+            created on the first run if it doesn't exist.
+        gcs_base_uri: `gs://bucket[/prefix]` the Parquet files are uploaded
+            under, as `{agency}/{afs_source_code}-{version}.parquet`.
+        local_dir: local working folder; each source gets its own
+            `{local_dir}/{afs_source_code}/` subfolder.
+        processor_registry: `afs_source_code -> processor class` mapping.
+        default_agency: GCS folder used when a config row has no `agency`.
         """
         self.bq_client = bq_client
         self.gcs_client = gcs_client
-        self.bucket_name = bucket_name
-        self.dataset_id = dataset_id
-        self.cfg_tbl_name = cfg_tbl_name
-        self.log_tbl_name = log_tbl_name
+        self.dataset_id = _full_id(dataset_id, 2, "dataset_id")
+        self.cfg_table_id = _full_id(cfg_table_id, 3, "cfg_table_id")
+        self.log_table_id = _full_id(log_table_id, 3, "log_table_id")
+        self.gcs_base_uri = gcs_base_uri.rstrip("/")
+        self.bucket_name, self.gcs_prefix = _split_gcs_uri(gcs_base_uri)
+        self.local_dir = local_dir
         self.processor_registry = processor_registry
+        self.default_agency = default_agency
 
-        self.key_column = "afs_source_code"
-
-        self.cfg_df: Optional[pd.DataFrame] = None
+        self.cfg_df: pd.DataFrame = pd.DataFrame()
         self.refresh_cfg()
 
-        # 当前数据源相关的派生状态，占位；实际值在 set_afs_source_code() 里计算
+        # State of the current source; set by set_afs_source_code().
         self.afs_source_code: Optional[str] = None
         self.local_folder: Optional[str] = None
         self.local_file_path: Optional[str] = None
         self.gcs_blob_name: Optional[str] = None
-        self.bq_exttbl_name: Optional[str] = None
-
-        if afs_source_code is not None:
-            self.set_afs_source_code(afs_source_code)
+        self.exttbl_id: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # 配置表：整表拉取 + 缓存
+    # Config table — read once, cached
     # ------------------------------------------------------------------
+
     def refresh_cfg(self) -> pd.DataFrame:
-        """从 BigQuery 拉取/刷新整张配置表，缓存为以 afs_source_code 为索引的 DataFrame。
-        批量运行多个数据源时只需要调用一次（构造时已自动调用），不必每个 code 都重新拉取。"""
-        query = f"SELECT * FROM `{self.cfg_tbl_name}`"
-        df = self.bq_client.query(query).to_dataframe()
+        """(Re)read the whole config table and cache it, indexed by
+        afs_source_code. Called by __init__; call again only after the
+        config table has been re-synced."""
+        df = self.bq_client.query(f"SELECT * FROM `{self.cfg_table_id}`").to_dataframe()
+        if KEY_COLUMN not in df.columns:
+            raise KeyError(f"Config table {self.cfg_table_id} has no '{KEY_COLUMN}' column.")
 
-        if self.key_column not in df.columns:
-            raise KeyError(f"配置表中未找到 '{self.key_column}' 列！")
-
-        df = df.set_index(self.key_column)
-        df = df[df.index.notnull() & (df.index != "")]
-        self.cfg_df = df
+        df = df.set_index(KEY_COLUMN)
+        self.cfg_df = df[df.index.notnull() & (df.index != "")]
+        print(f"Config table loaded: {len(self.cfg_df)} source(s) in {self.cfg_table_id}.")
         return self.cfg_df
 
-    # ------------------------------------------------------------------
-    # 当前数据源：唯一的状态设置入口
-    # ------------------------------------------------------------------
-    def set_afs_source_code(self, afs_source_code: str) -> None:
-        """切换当前处理的数据源，并立即重新计算所有依赖 code 的派生路径/名称
-        （local_folder / local_file_path / gcs_blob_name / bq_exttbl_name）。
-        这是唯一应该用来改变 pipeline 当前数据源的方法，其余方法都只读取
-        self.afs_source_code，不再单独接受 code 参数。
+    def list_source_codes(self) -> List[str]:
+        """Every afs_source_code in the cached config table."""
+        return list(self.cfg_df.index)
 
-        配置校验（afs_source_code 是否在配置表里、download_url 是否存在）在这里
-        就会执行并直接抛出，不做任何兜底——这样一旦切换成功，后续步骤就可以放心
-        使用派生出来的路径，而不用担心中途才发现配置有问题。
+    # ------------------------------------------------------------------
+    # Current source — the only way to switch it
+    # ------------------------------------------------------------------
+
+    def set_afs_source_code(self, afs_source_code: str) -> None:
+        """Switch the current source and derive everything that depends on
+        it (local paths, GCS blob, external table id).
+
+        The config row is checked here (code exists, download_url is set)
+        and any problem raises right away, so once this returns, every
+        later step can rely on the derived values.
         """
         self.afs_source_code = afs_source_code
-        self.local_folder = f"tmp/{afs_source_code}"
+        self.local_folder = os.path.join(self.local_dir, afs_source_code)
         self.local_file_path = os.path.join(self.local_folder, f"{afs_source_code}_raw")
-        self.bq_exttbl_name = f"src_{afs_source_code}_exttbl"
+        self.exttbl_id = f"{self.dataset_id}.src_{afs_source_code}_exttbl"
 
-        row = self._get_config_row()  # 配置有问题这里直接抛出
-        agency = row.get("agency") or "faostat"
+        row = self._get_config_row()  # raises on config problems
+        agency = row.get("agency") or self.default_agency
         version = self._resolve_version(row)
-        # GCS 路径按 "agency/afs_source_code-version.parquet" 两段式组织：
-        # agency 做顶层文件夹分组，afs_source_code 精确到具体数据源。
-        self.gcs_blob_name = f"{agency}/{afs_source_code}-{version}.parquet"
+        # `{agency}/{afs_source_code}-{version}.parquet`: agency groups the
+        # files by publisher, afs_source_code pins the exact source.
+        self.gcs_blob_name = f"{self.gcs_prefix}{agency}/{afs_source_code}-{version}.parquet"
 
     def _require_afs_source_code(self) -> str:
         if not self.afs_source_code:
-            raise RuntimeError("请先调用 set_afs_source_code() 指定要处理的数据源")
+            raise RuntimeError("No current source: call set_afs_source_code() first.")
         return self.afs_source_code
 
     # ------------------------------------------------------------------
-    # 配置行读取与校验
+    # Config row
     # ------------------------------------------------------------------
-    def _get_config_row(self) -> pd.Series:
-        """取出当前 afs_source_code 对应的配置行，并校验必填字段。
-        校验失败（code 不在配置表 / download_url 缺失）直接抛出，不做任何兜底。"""
-        code = self._require_afs_source_code()
 
+    def _get_config_row(self) -> pd.Series:
+        """The current source's config row. Raises if the code isn't in the
+        config table or has no download_url."""
+        code = self._require_afs_source_code()
         if code not in self.cfg_df.index:
-            raise KeyError(f"配置表中未找到 afs_source_code = '{code}'")
+            raise KeyError(f"afs_source_code '{code}' not found in {self.cfg_table_id}.")
 
         row = self.cfg_df.loc[code]
-        download_url = row.get("download_url")
-        if not download_url:
-            raise ValueError(f"配置 '{code}' 缺少必填字段 'download_url'")
-
+        if not row.get("download_url"):
+            raise ValueError(f"afs_source_code '{code}' has no 'download_url'.")
         return row
 
     @staticmethod
     def _resolve_version(row: pd.Series) -> str:
-        """优先用源头发布日期做版本号；解析失败退化为当前时间戳，
-        避免连续运行时用同一个固定字符串互相覆盖 GCS 上的历史版本。"""
+        """The source's publish date as the version; falls back to the
+        current timestamp so two runs never overwrite each other's file."""
         dt = pd.to_datetime(row.get("afs_source_updated_at"), errors="coerce")
         if pd.notnull(dt):
             return dt.strftime("%Y%m%d")
         return datetime.now().strftime("%Y%m%d%H%M%S")
 
     def _build_afs_src_lst(self, row: pd.Series, afs_source_ingested_at: str) -> Dict[str, str]:
-        """打包成需要随数据一起附加到每一行末尾的溯源信息
-        （不含 agency —— agency 只用于 GCS 路径分组，不需要跟着数据走）。"""
+        """Provenance columns appended to every output row (agency is only
+        used for the GCS folder, so it doesn't travel with the data)."""
         return {
             "afs_source_code": self.afs_source_code,
             "afs_source_updated_at": str(row.get("afs_source_updated_at") or ""),
@@ -192,53 +249,49 @@ class SourcePipeline:
     # ------------------------------------------------------------------
     # GCS
     # ------------------------------------------------------------------
+
     def get_gcs_uri(self) -> str:
         self._require_afs_source_code()
         return f"gs://{self.bucket_name}/{self.gcs_blob_name}"
 
     def check_gcs_version_exists(self) -> bool:
-        """独立、无副作用的检查方法：GCS 上是否已存在当前版本的 parquet。
-        只负责检查，不做任何"要不要跳过"的决策——决策交给调用方（比如 run()）。"""
+        """Side-effect-free check: is the current version already on GCS?
+        Only reports; run() decides whether to skip."""
         self._require_afs_source_code()
-        blob = self.gcs_client.bucket(self.bucket_name).blob(self.gcs_blob_name)
-        return blob.exists()
+        return self.gcs_client.bucket(self.bucket_name).blob(self.gcs_blob_name).exists()
 
     def upload_to_gcs(self, local_file_path: str) -> None:
         self._require_afs_source_code()
-        bucket = self.gcs_client.bucket(self.bucket_name)
-        blob = bucket.blob(self.gcs_blob_name)
-        blob.upload_from_filename(local_file_path)
-        print(f"☁️ 成功上传至 GCS: {self.get_gcs_uri()}")
+        self.gcs_client.bucket(self.bucket_name).blob(self.gcs_blob_name).upload_from_filename(local_file_path)
+        print(f"Uploaded to {self.get_gcs_uri()}")
 
     # ------------------------------------------------------------------
-    # 下载
+    # Download
     # ------------------------------------------------------------------
+
     def download(self, max_retries: int = 3) -> str:
-        """下载原始文件到本地，带指数退避重试。本地已有非空文件会自动跳过——
-        这一层缓存判断独立于 run() 的 force 参数，force 只影响 GCS 版本检查那一层，
-        想强制重新下载需要自己先删掉本地文件。
+        """Download the raw file, retrying with exponential backoff. A
+        non-empty local file is reused as-is (this cache is independent of
+        run()'s `force`; delete the file to force a fresh download).
 
-        - 请求统一带浏览器 User-Agent 和同域 Referer，避免被站点按 UA/防盗链拦截。
-        - 4xx 错误（403/404 等）是请求本身的问题，重试没有意义，直接抛出；
-          只有网络错误和 5xx 才会重试。
+        4xx errors (403 / 404 ...) are a problem with the request itself,
+        so they raise at once; only network errors and 5xx are retried.
         """
         code = self._require_afs_source_code()
-        row = self._get_config_row()
-        download_url = row["download_url"]
+        download_url = self._get_config_row()["download_url"]
 
         os.makedirs(self.local_folder, exist_ok=True)
-
         if os.path.exists(self.local_file_path) and os.path.getsize(self.local_file_path) > 0:
-            print(f"📦 本地已存在该文件，跳过下载: {self.local_file_path}")
+            print(f"Local file already exists, download skipped: {self.local_file_path}")
             return self.local_file_path
 
         parsed = urlparse(download_url)
-        headers = {**self.DEFAULT_HEADERS, "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
+        headers = {**DEFAULT_HEADERS, "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
 
         last_err: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
-                print(f"⬇️ 开始下载 (第 {attempt}/{max_retries} 次): {download_url}")
+                print(f"Downloading (attempt {attempt}/{max_retries}): {download_url}")
                 resp = requests.get(download_url, headers=headers, stream=True, timeout=30)
                 resp.raise_for_status()
 
@@ -253,102 +306,95 @@ class SourcePipeline:
                             pbar.update(len(chunk))
                 return self.local_file_path
 
-            except (requests.RequestException, OSError) as e:
-                last_err = e
+            except (requests.RequestException, OSError) as exc:
+                last_err = exc
                 if os.path.exists(self.local_file_path):
                     os.remove(self.local_file_path)
 
                 status_code = (
-                    e.response.status_code
-                    if isinstance(e, requests.HTTPError) and e.response is not None
+                    exc.response.status_code
+                    if isinstance(exc, requests.HTTPError) and exc.response is not None
                     else None
                 )
                 if status_code is not None and 400 <= status_code < 500:
                     raise RuntimeError(
-                        f"下载 '{code}' 失败 (HTTP {status_code})，客户端错误不再重试: {e}"
-                    ) from e
+                        f"Download of '{code}' failed (HTTP {status_code}); client errors are not retried: {exc}"
+                    ) from exc
 
-                print(f"⚠️ 下载失败 (第 {attempt} 次): {e}")
+                print(f"WARNING: download attempt {attempt} failed: {exc}")
                 if attempt < max_retries:
-                    time.sleep(2 ** attempt)  # 指数退避: 2s, 4s, 8s...
+                    time.sleep(2 ** attempt)  # 2s, 4s, 8s, ...
 
-        raise RuntimeError(f"下载 '{code}' 失败，已重试 {max_retries} 次: {last_err}")
+        raise RuntimeError(f"Download of '{code}' failed after {max_retries} attempt(s): {last_err}")
 
     # ------------------------------------------------------------------
-    # Processor（不 import 具体类，完全依赖外部传入的 processor_registry）
+    # Processor — looked up in processor_registry, never imported
     # ------------------------------------------------------------------
+
     def build_processor(self, afs_source_ingested_at: Optional[str] = None):
-        """用当前数据源实例化对应的 processor。
-
-        processor 类从 processor_registry[afs_source_code] 查找；未注册的 code
-        如何处理完全由 registry 自身决定（推荐 registry 用 defaultdict 提供默认类），
-        本方法不假设、也不 import 任何具体的 processor 类。
-
-        afs_source_ingested_at 不传时用占位符 "PREVIEW"，方便单步调试时先构造出
-        processor、预览 schema，而不用先真正跑一次摄入时间戳。
-        """
+        """Instantiate the current source's processor from
+        processor_registry. Without afs_source_ingested_at the placeholder
+        "PREVIEW" is used, so a processor can be built and previewed while
+        debugging without a real ingestion timestamp."""
         code = self._require_afs_source_code()
         row = self._get_config_row()
-
-        ingested_at = afs_source_ingested_at or "PREVIEW"
-        afs_src_lst = self._build_afs_src_lst(row, ingested_at)
-
         processor_cls = self.processor_registry[code]
         return processor_cls(
             raw_file_path=self.local_file_path,
             local_folder=self.local_folder,
             afs_source_code=code,
-            afs_src_lst=afs_src_lst,
+            afs_src_lst=self._build_afs_src_lst(row, afs_source_ingested_at or "PREVIEW"),
         )
 
     # ------------------------------------------------------------------
-    # BigQuery 外部表
+    # BigQuery external table
     # ------------------------------------------------------------------
-    def build_external_parquet_table(self) -> bigquery.Table:
-        """因为 parquet 自带列信息，这里不需要额外配置 schema。
-        会删除同名的旧外部表（如果存在）并重新创建。"""
-        self._require_afs_source_code()
-        source_uri = self.get_gcs_uri()
-        external_config = bigquery.ExternalConfig("PARQUET")
-        external_config.source_uris = [source_uri]
 
-        table_ref = self.bq_client.dataset(self.dataset_id).table(self.bq_exttbl_name)
-        table = bigquery.Table(table_ref)
+    def build_external_parquet_table(self) -> bigquery.Table:
+        """Drop and recreate `src_{afs_source_code}_exttbl` on the current
+        GCS file. Parquet carries its own schema, so none is configured."""
+        self._require_afs_source_code()
+        external_config = bigquery.ExternalConfig("PARQUET")
+        external_config.source_uris = [self.get_gcs_uri()]
+
+        table = bigquery.Table(self.exttbl_id)
         table.external_data_configuration = external_config
 
-        self.bq_client.delete_table(table_ref, not_found_ok=True)
-        created_table = self.bq_client.create_table(table)
-        print(f"✅ BQ Parquet 外部表创建成功: {created_table.full_table_id}")
-        return created_table
+        self.bq_client.delete_table(self.exttbl_id, not_found_ok=True)
+        created = self.bq_client.create_table(table)
+        print(f"External table created: {created.full_table_id}")
+        return created
 
     # ------------------------------------------------------------------
-    # 日志 / 配置回写
+    # Logging / config write-back
     # ------------------------------------------------------------------
+
     def _ensure_log_table_exists(self, row: Dict[str, Any]) -> None:
-        """日志表不存在时，按 row 的字段自动建一张全 STRING 类型的表；已存在就什么都不做。"""
+        """Create the log table (all STRING columns, from the row's keys)
+        if it doesn't exist yet."""
         try:
-            self.bq_client.get_table(self.log_tbl_name)
+            self.bq_client.get_table(self.log_table_id)
         except NotFound:
             schema = [bigquery.SchemaField(col, "STRING") for col in row]
-            table = bigquery.Table(self.log_tbl_name, schema=schema)
-            self.bq_client.create_table(table)
-            print(f"🆕 [Log] 日志表不存在，已自动创建: '{self.log_tbl_name}'")
+            self.bq_client.create_table(bigquery.Table(self.log_table_id, schema=schema))
+            print(f"Created log table `{self.log_table_id}`.")
 
     def _log_run(self, row: Dict[str, Any]) -> None:
-        """追加一行到 BigQuery 日志表。只记录 pipeline 的运行过程
-        （run() 内部调用），不涉及配置本身是否合法这类校验错误。"""
+        """Append one row to the log table (pipeline runs only; config
+        errors are never logged)."""
         self._ensure_log_table_exists(row)
-        errors = self.bq_client.insert_rows_json(self.log_tbl_name, [row])
+        errors = self.bq_client.insert_rows_json(self.log_table_id, [row])
         if errors:
-            print(f"❌ 写入日志表失败: {errors}")
-        else:
-            print(f"📝 [Log] 成功记录日志到 '{self.log_tbl_name}'")
+            print(f"WARNING: failed to write to {self.log_table_id}: {errors}")
 
     def _update_config_fields(self, fields: Dict[str, Any]) -> None:
-        """任务成功后，按 afs_source_code 把若干字段回写到配置表。"""
+        """Write the given fields back to the current source's config row.
+
+        One UPDATE per source: with many hundreds of sources in one batch,
+        BigQuery DML quotas may make a single MERGE at the end preferable.
+        """
         if not fields:
             return
-
         code = self._require_afs_source_code()
         set_clause = ", ".join(f"{col} = @{col}" for col in fields)
         query_parameters = [
@@ -356,59 +402,55 @@ class SourcePipeline:
         ]
         query_parameters.append(bigquery.ScalarQueryParameter("key_value", "STRING", code))
 
-        query = f"""
-            UPDATE `{self.cfg_tbl_name}`
-            SET {set_clause}
-            WHERE {self.key_column} = @key_value
+        sql = f"""
+        UPDATE `{self.cfg_table_id}`
+        SET {set_clause}
+        WHERE {KEY_COLUMN} = @key_value
         """
-        job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
-        self.bq_client.query(query, job_config=job_config).result()
-        print(f"🔄 [Cfg] 已更新 '{code}': {fields}")
-        # 注：如果一次要跑很多个数据源，逐行 UPDATE 可能会触及 BigQuery 的
-        # DML 并发/配额限制。数据源数量增长到几十上百时，建议改成先攒好一批结果，
-        # 最后用一条 MERGE 语句批量回写，而不是每个 code 单独 UPDATE 一次。
+        self.bq_client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=query_parameters)).result()
+        print(f"Config updated for '{code}': {fields}")
 
     # ------------------------------------------------------------------
-    # 清理
+    # Cleanup
     # ------------------------------------------------------------------
+
     def cleanup(self) -> None:
+        """Delete the current source's local working folder."""
         if self.local_folder and os.path.exists(self.local_folder):
             shutil.rmtree(self.local_folder)
-            print(f"🧹 临时本地文件已清理: {self.local_folder}")
+            print(f"Local files removed: {self.local_folder}")
 
     # ------------------------------------------------------------------
-    # 一键运行
+    # Public entry point — one source
     # ------------------------------------------------------------------
+
     def run(self, force: bool = False, cleanup: bool = False) -> Dict[str, Any]:
-        """跑完整个流水线，返回一个结果 dict（同时也是写入日志表的那一行）。
+        """Run the whole flow for the current source and return the result
+        (the same dict that is written to the log table).
 
-        - 配置问题（afs_source_code 未设置 / 配置表里找不到 / download_url 缺失）
-          不在这里兜底，会直接抛出，交给调用方处理，也不会写入日志表。
-        - force=True 时跳过 GCS 版本检查这一层，强制重新走一遍下载/转换/上传；
-          本地文件缓存的判断不受 force 影响。
-        - 流程执行中的问题（下载/转换/上传/建表失败）会被捕获，记为 FAILED，
-          并照常写入日志表。
-        - cleanup=True 时运行结束后清理本地临时文件（不论成功/跳过/失败）。
+        - force=False skips the source (SKIPPED) when its current version
+          is already on GCS; force=True re-runs it anyway. The local file
+          cache is not affected by force.
+        - Errors while running are caught, recorded as FAILED and logged.
+          Config problems raise (see the module docstring).
+        - cleanup=True removes the local files afterwards, whatever the
+          outcome.
         """
         code = self._require_afs_source_code()
-        row = self._get_config_row()  # 配置问题在这里直接抛出，不进入下面的 try
+        row = self._get_config_row()  # config problems raise here, outside the try
 
-        status = "FAILED"
-        message = ""
-        gcs_uri = None
-        bq_table_id = None
-        afs_source_ingested_at = ""
+        status, message = "FAILED", ""
+        gcs_uri = bq_table_id = afs_source_ingested_at = ""
 
         try:
             if not force and self.check_gcs_version_exists():
                 status = "SKIPPED"
-                message = f"GCS 中已存在 {self.gcs_blob_name}"
+                message = f"{self.get_gcs_uri()} already exists"
             else:
                 self.download()
-
                 afs_source_ingested_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 processor = self.build_processor(afs_source_ingested_at)
-                print(f"⚡ 执行数据转换逻辑 (processor: {processor.__class__.__name__})...")
+                print(f"Transforming with {processor.__class__.__name__}...")
                 parquet_path = processor.process()
 
                 self.upload_to_gcs(parquet_path)
@@ -417,18 +459,16 @@ class SourcePipeline:
                 status = "SUCCESS"
                 gcs_uri = self.get_gcs_uri()
                 bq_table_id = table.full_table_id
-
-        except Exception as e:
-            status = "FAILED"
-            message = str(e)
+        except Exception as exc:  # noqa: BLE001 - any failure here is a FAILED run, logged below
+            status, message = "FAILED", str(exc)
 
         result = {
             "execution_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "afs_source_code": code,
             "afs_source_updated_at": str(row.get("afs_source_updated_at") or ""),
             "afs_source_ingested_at": afs_source_ingested_at,
-            "gcs_uri": gcs_uri or "",
-            "bq_table_id": bq_table_id or "",
+            "gcs_uri": gcs_uri,
+            "bq_table_id": bq_table_id,
             "status": status,
             "message": message,
         }
@@ -436,11 +476,58 @@ class SourcePipeline:
         self._log_run(result)
         if status == "SUCCESS":
             self._update_config_fields({"afs_source_ingested_at": afs_source_ingested_at})
-
         if cleanup:
             self.cleanup()
 
-        icon = {"SUCCESS": "✅", "SKIPPED": "⏭️", "FAILED": "❌"}.get(status, "❓")
-        print(f"{icon} {code}: {status} {message}")
-
+        print(f"{code} -> {status}" + (f": {message}" if message else ""))
         return result
+
+    # ------------------------------------------------------------------
+    # Public entry point — many sources
+    # ------------------------------------------------------------------
+
+    def _resolve_codes(self, afs_source_codes: Union[None, str, Iterable[str]]) -> List[str]:
+        """None -> every source in the config table; a single code or a list
+        -> those codes, de-duplicated in order. Unknown codes are kept, so
+        they show up as FAILED instead of disappearing silently."""
+        if afs_source_codes is None:
+            return self.list_source_codes()
+        if isinstance(afs_source_codes, str):
+            afs_source_codes = [afs_source_codes]
+        return list(dict.fromkeys(afs_source_codes))
+
+    def run_batch(
+        self,
+        afs_source_codes: Union[None, str, Iterable[str]] = None,
+        force: bool = False,
+        cleanup: bool = True,
+    ) -> pd.DataFrame:
+        """run() for each source in turn; one source failing doesn't stop
+        the others. afs_source_codes=None runs every source in the config
+        table. Returns one row per source (see RESULT_COLUMNS).
+
+        A config error (code not in the config table, no download_url) is
+        reported as FAILED here but not written to the log table.
+        """
+        codes = self._resolve_codes(afs_source_codes)
+        results: List[Dict[str, Any]] = []
+
+        for n, code in enumerate(codes, start=1):
+            print(f"\n{'=' * 60}\n[{n}/{len(codes)}] {code}\n{'=' * 60}")
+            try:
+                self.set_afs_source_code(code)
+            except (KeyError, ValueError) as exc:
+                print(f"{code} -> FAILED: config error: {exc}")
+                results.append({"afs_source_code": code, "status": "FAILED", "message": f"Config error: {exc}"})
+                continue
+            try:
+                results.append(self.run(force=force, cleanup=cleanup))
+            except Exception as exc:  # noqa: BLE001 - e.g. log/config write failed; keep going
+                print(f"{code} -> FAILED: {exc}")
+                results.append({"afs_source_code": code, "status": "FAILED", "message": str(exc)})
+
+        df = pd.DataFrame(results, columns=RESULT_COLUMNS)
+        counts = df["status"].value_counts().to_dict()
+        print(f"\nBatch finished: {len(df)} source(s) — "
+              + ", ".join(f"{s}: {counts.get(s, 0)}" for s in ("SUCCESS", "SKIPPED", "FAILED")))
+        return df
