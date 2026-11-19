@@ -628,6 +628,80 @@ class ScpHatNationalProcessor(BaseSourceProcessor):
         )
 
 
+class IlostatProcessor(ScpHatNationalProcessor):
+    """ILOSTAT 指标（ilostat_emp_dwap_rt / ilostat_emp_xtru_rt / ilostat_emp_xtru_nb 共用）。
+
+    下载的是 zip，解压后是长表 csv（ref_area.label | indicator.label | sex.label | ... | time | obs_value）。
+    只新增一列 ref_area.m49code：把 ref_area.label（国家/区域名称）转成 3 位 M49 码。
+    - 名称 -> M49 复用 ScpHatNationalProcessor._build_m49_mapping
+      （REGION_M49 精确匹配 -> coco 转 ISO3 -> 查 UNcode；匹配不上为 NULL 并打印）。
+    - 额外规则：ILOSTAT 的聚合区域常写成 "Africa: Northern Africa"、"World: Low income"
+      这种带冒号的形式，是 ILO 自己的分组口径，不等同 M49 区域，且交给 coco 正则容易误匹配，
+      所以直接置 NULL，不参与转换。
+    注：finalize_to_parquet 会 slugify 列名，落盘后两列分别是 ref_area_label / ref_area_m49code。
+    """
+
+    AREA_COL = "ref_area.label"
+    M49_COL = "ref_area.m49code"
+
+    def read_and_transform(self, input_path: str) -> pl.LazyFrame:
+        lfs = []
+        for csv_path in self._find_target_csvs(input_path):
+            lf = pl.scan_csv(csv_path, infer_schema=False)
+            cols = lf.collect_schema().names()
+
+            # 防御：个别导出文件首列带 UTF-8 BOM
+            renames = {c: c.lstrip("﻿").strip() for c in cols if c != c.lstrip("﻿").strip()}
+            if renames:
+                lf = lf.rename(renames)
+                cols = lf.collect_schema().names()
+
+            if self.AREA_COL not in cols:
+                print(f"⏭️ {os.path.basename(csv_path)} 中没有列 '{self.AREA_COL}'，跳过。现有列: {cols}")
+                continue
+            print(f"📄 读取: {csv_path}")
+            lfs.append(lf)
+
+        if not lfs:
+            raise KeyError(f"{input_path} 下没有任何包含 '{self.AREA_COL}' 列的 csv")
+        lf = lfs[0] if len(lfs) == 1 else pl.concat(lfs, how="diagonal")
+
+        # 名称 -> M49 对照表（只对去重后的名称做一次转换）
+        names = lf.select(pl.col(self.AREA_COL).unique()).collect()[self.AREA_COL].to_list()
+        df_m49 = self._build_m49_mapping(names)
+        return lf.join(df_m49.lazy(), on=self.AREA_COL, how="left")
+
+    # ------------------------------------------------------------------
+    def _find_target_csvs(self, input_path: str) -> List[str]:
+        """非 zip 时 input_path 就是 csv 本身；zip 时递归找解压目录下所有 csv（忽略 __MACOSX）。"""
+        if not os.path.isdir(input_path):
+            return [input_path]
+        csv_paths = []
+        for root, dirs, files in os.walk(input_path):
+            dirs[:] = [d for d in dirs if d != "__MACOSX"]
+            csv_paths += [os.path.join(root, f) for f in files if f.lower().endswith(".csv")]
+        if not csv_paths:
+            raise FileNotFoundError(f"在 {input_path} 中未找到任何 csv 文件")
+        return sorted(csv_paths)
+
+    def _build_m49_mapping(self, names: List[Optional[str]]) -> pl.DataFrame:
+        """带冒号的 ILO 聚合区域直接置 NULL，其余交给父类转换。"""
+        ilo_aggregates = sorted(n for n in names if n and ":" in n)
+        plain = [n for n in names if not (n and ":" in n)]
+
+        df = super()._build_m49_mapping(plain)
+        if ilo_aggregates:
+            print(f"ℹ️ 以下为 ILO 自定义聚合区域，{self.M49_COL} 置 NULL: {ilo_aggregates}")
+            df = pl.concat([
+                df,
+                pl.DataFrame(
+                    {self.AREA_COL: ilo_aggregates, self.M49_COL: [None] * len(ilo_aggregates)},
+                    schema={self.AREA_COL: pl.Utf8, self.M49_COL: pl.Utf8},
+                ),
+            ])
+        return df
+
+
 # ----------------------------------------------------------------------
 # 注册表：afs_source_code -> processor 类（不是实例）
 #
@@ -645,5 +719,8 @@ AFS_SOURCE_PROCESSORS: Dict[str, Type[BaseSourceProcessor]] = defaultdict(
         "fao_fishstat_globalproduction": FishstatGlobalProductionProcessor,
         "fao_fishstat_processed": FishstatProcessedProcessor,
         "scp_hat_national": ScpHatNationalProcessor,
+        "ilostat_emp_dwap_rt": IlostatProcessor,
+        "ilostat_emp_xtru_rt": IlostatProcessor,
+        "ilostat_emp_xtru_nb": IlostatProcessor,
     },
 )
