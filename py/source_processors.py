@@ -306,16 +306,33 @@ class AgIncentivesProcessor(BaseSourceProcessor):
     这里递归查找目标文件，不依赖具体的子文件夹名。
 
     注：源文件中 Year / REGIONFAOCODE 等整数代码列本身就带 ".0"（如 2005.0），
-    source 阶段保持原样，留给下游清洗阶段处理。
+    这里统一去掉：除数值列（VALUE_COLUMNS）外，所有形如 "2005.0" 的值都改成 "2005"。
+    非整数（如 "12.5"）和非数字的值不受影响。数值列保持原始字符串不动。
     数据更新年份后（如 Aggregated_NRA 2026.csv），需要同步修改 TARGET_FILENAME。
     """
 
     TARGET_FILENAME = "Aggregated_NRA 2025.csv"
 
+    # 数值列，不做 ".0" 处理；按小写比较，不依赖源文件列名的大小写
+    VALUE_COLUMNS = {"support_usd", "relevantvalueproduction", "nra"}
+
     def read_and_transform(self, input_path: str) -> pl.LazyFrame:
+        return self._strip_integer_suffix(pl.scan_csv(self._find_file(input_path), infer_schema=False))
+
+    def _strip_integer_suffix(self, lf: pl.LazyFrame) -> pl.LazyFrame:
+        """非数值列：把 "2005.0" 这类整数值末尾的 ".0" 去掉。"""
+        code_cols = [
+            c for c in lf.collect_schema().names()
+            if c.strip().lower() not in self.VALUE_COLUMNS
+        ]
+        return lf.with_columns(
+            pl.col(code_cols).str.replace(r"^\s*(-?\d+)\.0+\s*$", "${1}")
+        )
+
+    def _find_file(self, input_path: str) -> str:
         if not os.path.isdir(input_path):
             # 理论上下载下来是 zip，这里兜底：如果直接给的就是文件，原样使用
-            return pl.scan_csv(input_path, infer_schema=False)
+            return input_path
 
         matches = [
             os.path.join(root, f)
@@ -330,7 +347,7 @@ class AgIncentivesProcessor(BaseSourceProcessor):
             raise RuntimeError(f"找到多个 {self.TARGET_FILENAME}，无法确定使用哪个: {matches}")
 
         print(f"📄 使用文件: {matches[0]}")
-        return pl.scan_csv(matches[0], infer_schema=False)
+        return matches[0]
 
 
 class FishstatGlobalProductionProcessor(BaseSourceProcessor):

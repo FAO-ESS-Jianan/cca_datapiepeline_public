@@ -5,7 +5,7 @@
 --   source_table  外部表
 --   ref_m49_table m49 参照表
 -- 注：
---   1. 源文件中 year / regionfaocode 等整数列带 ".0"（如 2005.0），在 src 中去掉
+--   1. 源文件中 year / regionfaocode 等整数列带的 ".0" 已在 AgIncentivesProcessor 中去掉
 --   2. 源表有三个数值列，UNPIVOT 成长表，每个源行拆成三行，measure 记录来源列：
 --        support_usd             -> 支持额（USD）
 --        relevantvalueproduction -> 相关产值（USD）
@@ -16,10 +16,7 @@
 CREATE OR REPLACE VIEW {{ target_view }} AS
 
 WITH src AS (
-  SELECT
-    * EXCEPT(year, regionfaocode),
-    REGEXP_REPLACE(CAST(year AS STRING), r"\.0+$", '')          AS year,
-    REGEXP_REPLACE(CAST(regionfaocode AS STRING), r"\.0+$", '') AS regionfaocode
+  SELECT *
   FROM {{ source_table }}
 ),
 
